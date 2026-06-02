@@ -1,0 +1,5 @@
+rosbags/*
+rl/logs*
+rl/models*
+.claude/*
+*/__pycache__/*

@@ -1,0 +1,65 @@
+drone:
+  # Default namespace for single-env mode; first entry of `namespaces` is used
+  # if present.
+  namespace: drone0
+  # Used by the swarm vec env. Add or remove entries to match the running sim
+  # (e.g. ./launch_as2.bash -m spawns drone0/drone1/drone2 from world_swarm.yaml).
+  namespaces: [drone0, drone1, drone2, drone3, drone4, drone5, drone6, drone7,
+               drone8, drone9]
+  use_sim_time: true
+  spin_rate_hz: 100.0
+
+control_hz: 10.0
+takeoff_height: 1.5
+takeoff_speed: 1.0
+
+action:
+  v_max: 2.0            # m/s, applied to vx, vy, vz
+  yaw_rate_max: 1.5708  # rad/s (= pi/2)
+
+
+# Episode terminates if drone leaves this box.
+workspace:
+  x_min: -10.0
+  x_max:  10.0
+  y_min: -10.0
+  y_max:  10.0
+  z_min:  0.3
+  z_max:  4.0
+
+# Fixed target pose (world / ENU frame). yaw is the desired final orientation
+# of the drone at the goal (mirrors the gate yaw in the ROS1 setup); kept
+# fixed for visualization — the drone's init yaw is already randomised, so
+# the relative yaw error still spans the full range during training.
+target:
+  x: 0.0
+  y: 0.0
+  z: 1.75
+  yaw: 0.0
+
+# Per-reset drone spawn region (centred around the target x, y).
+init_bounds:
+  x_min: -9.0
+  x_max:  9.0
+  y_min: -9.0
+  y_max:  9.0
+  z_min:  0.4
+  z_max:  2.5
+min_init_target_dist: 1.0
+
+reward:
+  # All weights act on values pre-normalized to [0, 1].
+  k_pos: 0.01           # distance penalty (xy)
+  k_height: 0.05        # height penalty (|z|)
+  k_bearing: 0.02       # face-the-target penalty (|atan2(body_y, body_x)|/π)
+  k_yaw_align: 0.02     # orientation-match penalty (|yaw_drone − yaw_target|/π)
+  k_speed: 0.02         # bonus for forward body velocity only: + k_speed · clip(vx_body/v_max, 0, 1)
+  k_vertical: 0.02      # penalty on vertical speed: − k_vertical · |vz_body|/v_max
+  success_bonus: 100.0  # terminal, scaled by yaw alignment · forward speed · centering
+  oob_penalty: 50.0
+
+tolerance:
+  pos_tol: 0.20         # m  (xy distance to target for success)
+
+episode:
+  max_steps: 300        # 30 s at 10 Hz
