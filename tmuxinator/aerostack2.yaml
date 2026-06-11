@@ -4,10 +4,17 @@ drone_namespace           = @settings["drone_namespace"]
 simulation_config_file    = @settings["simulation_config_file"]
 motion_controller_plugin  = @settings["motion_controller_plugin"]
 base_launch               = @settings["base_launch"] == "true"
+# Per-drone DDS isolation. When set (via launch_as2.bash -d), every pane in
+# this drone's tmux session inherits ROS_DOMAIN_ID and talks only to its own
+# platform processes. Empty/0 keeps the current single-domain behaviour.
+ros_domain_id             = @settings["ros_domain_id"].to_s
 %>
 name: <%= drone_namespace %>
 attach: false
 root: ./
+<% if !ros_domain_id.empty? %>
+pre_window: export ROS_DOMAIN_ID=<%= ros_domain_id %>
+<% end %>
 startup_window: mission_monitoring
 windows:
   # Platform
@@ -20,6 +27,14 @@ windows:
             config_file:=config/config.yaml
             uav_config:=config/uav_config.yaml
             world_config:=<%= simulation_config_file %>
+            use_sim_time:=true
+        # Per-domain /clock authority. Each drone runs on its own
+        # ROS_DOMAIN_ID (set via pre_window above), so /clock is NOT shared
+        # across drones — every drone needs its own publisher on its own
+        # domain. The sim_clock_publisher_node also hosts the SetBool
+        # service /sim_clock_publisher/pause_physics, which DroneGoalEnv
+        # calls to freeze this drone's simulator at rollout boundaries.
+        - ros2 launch as2_platform_multirotor_simulator sim_clock_publisher.launch.py
 
   # Basic Robotics Functions
   - basics_robotics_functions:

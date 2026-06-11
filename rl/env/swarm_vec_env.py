@@ -51,12 +51,18 @@ class SwarmDummyVecEnv(DummyVecEnv):
 
     def step_async(self, actions: np.ndarray) -> None:
         self.actions = actions
+        # _apply_action unpauses each env's physics individually.
         for env, action in zip(self.envs, actions):
             env._apply_action(action)
         self._send_time = time.monotonic()
 
     def step_wait(self):
-        # Sleep once so every drone gets the same control period.
+        # Sleep one control period of *real* time so the simulator integrates
+        # exactly dt with the new command. Then freeze each drone's physics
+        # *before* reading its state so the observation reflects the moment
+        # of pause, not a state that keeps drifting while we read it. The
+        # freeze also persists through the outer loop (policy.predict,
+        # bookkeeping…) so the next dt window starts cleanly.
         if self._send_time is not None:
             elapsed = time.monotonic() - self._send_time
             if elapsed < self._dt:
@@ -64,6 +70,7 @@ class SwarmDummyVecEnv(DummyVecEnv):
 
         for env_idx in range(self.num_envs):
             env = self.envs[env_idx]
+            env._set_physics(True)
             obs, self.buf_rews[env_idx], terminated, truncated, self.buf_infos[env_idx] = \
                 env._observe_step()
             self.buf_dones[env_idx] = terminated or truncated

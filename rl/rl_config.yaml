@@ -7,59 +7,193 @@ drone:
   namespaces: [drone0, drone1, drone2, drone3, drone4, drone5, drone6, drone7,
                drone8, drone9]
   use_sim_time: true
-  spin_rate_hz: 100.0
+  spin_rate_hz: 500.0
 
-control_hz: 10.0
+control_hz: 100.0     # Hz. Each env step represents 1/control_hz of sim
+                      # time (the pause-physics trick decouples this from
+                      # wall time, so Python overhead doesn't pollute the
+                      # per-step dynamics window). At 100 Hz the rates-mode
+                      # inner loop matches the platform's cmd_freq / sim
+                      # control_freq, halving attitude-error latency vs 50
+                      # Hz. Several params downstream are step-counted
+                      # rather than time-counted and so must scale with
+                      # this: episode.max_steps, every per-step reward
+                      # weight in `reward:`, and on the PPO side `gamma`
+                      # and `sde_sample_freq` in train.py.
 takeoff_height: 1.5
 takeoff_speed: 1.0
 
+training:
+  # Vectorized env backend: "subproc" runs one DroneGoalEnv per subprocess
+  # (true parallelism, recommended for >2 drones). "dummy" runs all envs in
+  # the main process; lower setup cost, simpler stack traces, but serializes
+  # under the GIL.
+  vec_env: subproc
+  # Base ROS_DOMAIN_ID for per-drone DDS isolation. When set, drone i runs
+  # on `base + i`; must match the value passed to launch_as2.bash -d.
+  # Set to null (or omit) to leave ROS_DOMAIN_ID alone (single shared domain).
+  base_ros_domain_id: 0
+
 action:
-  v_max: 2.0            # m/s, applied to vx, vy, vz
-  yaw_rate_max: 1.5708  # rad/s (= pi/2)
+  # Selects how the 4-D policy action is interpreted.
+  #   "speed" → action = [vx, vy, vz, yaw_rate]  (body-frame velocity + yaw
+  #             rate). Goes through the AS2 motion controller. Original mode.
+  #   "rates" → action = [roll_rate, pitch_rate, yaw_rate, thrust]. Bypasses
+  #             the motion controller and publishes directly to the
+  #             platform's actuator_command/{thrust,twist} topics. The PID
+  #             controller in this stack doesn't accept ACRO as input, so
+  #             the direct-publish route is the only one that works without
+  #             rebuilding the controller. NOTE: action semantics are
+  #             completely different — a speed-mode checkpoint cannot be
+  #             loaded in rates mode and vice versa.
+  mode: rates
+  v_max: 20.0           # m/s. In speed mode: per-axis action scale.
+                        # In rates mode: still used for velocity-obs tanh
+                        # scale and reward terms (k_speed, k_vertical,
+                        # omni_speed_score). 20 m/s is a realistic upper
+                        # bound for rates-mode drone speeds; raising it
+                        # stretches the tanh's "fast vs cruise" boundary
+                        # and the speed-bonus saturation point.
+  yaw_rate_max: 8.0  # rad/s (= pi) (speed mode only)
+  rates:                # used only when mode == "rates"
+    roll_rate_max:  16.0   # rad/s, per-axis body-rate limit
+    pitch_rate_max: 16.0
+    yaw_rate_max:   8.0
+    # Thrust in Newtons. Hover thrust for the 1 kg UAV is ~9.81 N; the
+    # multirotor model in uav_config.yaml puts the per-motor saturation
+    # at ~9.2 N (= 4 × 9.2 ≈ 37 N total max).
+    #
+    # Action mapping is HOVER-CENTERED, piecewise linear:
+    #   action[3] = -1  → thrust_min   (max descent / cut motors)
+    #   action[3] =  0  → thrust_hover (drone hangs in place)
+    #   action[3] = +1  → thrust_max   (max climb)
+    # So a freshly-initialized policy outputting ~0 on every dimension
+    # actually hovers instead of climbing (which would happen if we used
+    # the linear midpoint of [thrust_min, thrust_max]).
+    thrust_min:    0.0    # N
+    thrust_hover:  9.81   # N — set to vehicle_mass · g for the UAV in
+                          # uav_config.yaml. If you change the mass there,
+                          # re-tune this so action[3]=0 actually hovers.
+    thrust_max:   30.0    # N
 
 
 # Episode terminates if drone leaves this box.
-workspace:
-  x_min: -10.0
-  x_max:  10.0
-  y_min: -10.0
-  y_max:  10.0
-  z_min:  0.3
-  z_max:  4.0
+# workspace:
+#   # NOTE: only used to derive observation normalization divisors (max_dist_xy,
+#   # pos_max_z). The OOB check uses `oob_box` below (symmetric half-extents
+#   # around the *current* target).
+#   x_min: -15.0
+#   x_max:  15.0
+#   y_min: -15.0
+#   y_max:  15.0
+#   z_min:  -4.0
+#   z_max:  4.0
 
-# Fixed target pose (world / ENU frame). yaw is the desired final orientation
-# of the drone at the goal (mirrors the gate yaw in the ROS1 setup); kept
-# fixed for visualization — the drone's init yaw is already randomised, so
-# the relative yaw error still spans the full range during training.
+# OOB half-extents around the current (runtime) target. Drone is OOB when
+# |drone − target|_axis exceeds the corresponding extent. Symmetric — there's
+# no "above/below" asymmetry to think about even when the target is far from
+# its config position (e.g. multi-gate test_track at z=4).
+oob_box:
+  x: 11.0
+  y: 11.0
+  z:  3.0
+
+# Fallback (single) target pose for evaluation / fixed-target runs. Used by
+# the env when `target_bounds` is absent. yaw is the desired final orientation
+# of the drone at the goal (mirrors the gate yaw in the ROS1 setup).
 target:
   x: 0.0
   y: 0.0
-  z: 1.75
+  z: 4.0
   yaw: 0.0
 
-# Per-reset drone spawn region (centred around the target x, y).
+# Per-reset target sampling. Position is pinned at the origin so multi-drone
+# DDS-isolated training renders cleanly (each drone's gate sits at the same
+# world point), but yaw is fully randomized in [-π, π]. Yaw randomization
+# used to be load-bearing so the policy would learn to use the obs[6] yaw-
+# alignment channel as a *relative* signal instead of memorising the world
+# heading. obs[6] is now bearing-to-target (target's angle in body frame)
+# rather than yaw alignment, so the randomization is no longer required
+# for that reason — but it's still useful to keep target_yaw varied so the
+# back-entry geometry check (gate "front" side) doesn't always face the
+# same world direction. Delete the whole block to revert to the fixed
+# `target` above (zero randomization).
+target_bounds:
+  x_min: 0.0
+  x_max: 0.0
+  y_min: 0.0
+  y_max: 0.0
+  z_min: 4.0
+  z_max: 4.0
+  yaw_min: -3.14159265
+  yaw_max:  3.14159265
+
+# Per-reset drone spawn box, expressed as OFFSETS from the current target
+# pose. So e.g. x_min: -5 means "spawn the drone up to 5 m -x of target".
+# z bounds are symmetric (small) so the drone stays inside the absolute
+# workspace.z window regardless of where target.z lands.
 init_bounds:
   x_min: -9.0
   x_max:  9.0
   y_min: -9.0
   y_max:  9.0
-  z_min:  0.4
+  z_min:  -2.5
   z_max:  2.5
-min_init_target_dist: 1.0
+min_init_target_dist: 4.0  # m, in absolute world units
 
 reward:
-  # All weights act on values pre-normalized to [0, 1].
-  k_pos: 0.01           # distance penalty (xy)
-  k_height: 0.05        # height penalty (|z|)
-  k_bearing: 0.02       # face-the-target penalty (|atan2(body_y, body_x)|/π)
-  k_yaw_align: 0.02     # orientation-match penalty (|yaw_drone − yaw_target|/π)
-  k_speed: 0.02         # bonus for forward body velocity only: + k_speed · clip(vx_body/v_max, 0, 1)
-  k_vertical: 0.02      # penalty on vertical speed: − k_vertical · |vz_body|/v_max
-  success_bonus: 100.0  # terminal, scaled by yaw alignment · forward speed · centering
-  oob_penalty: 50.0
+  # All weights act on values pre-normalized to [0, 1]. Per-step weights
+  # were halved when control_hz went 50 → 100: an episode now contains 2×
+  # as many steps, so the same per-step weights would double the total
+  # per-episode shaping reward and shift the per-step-vs-terminal balance
+  # away from the success bonus. Halving keeps the per-episode reward
+  # scale unchanged. Terminal-event rewards (success/oob/crash) are NOT
+  # rescaled — they fire once per episode regardless of step rate.
+  k_pos: 0.005           # distance penalty (xy)
+  k_height: 0.005        # height penalty (|z|)
+  k_bearing: 0.005       # face-the-target penalty (|atan2(body_y, body_x)|/π)
+  k_yaw_align: 0.0       # was 0.005. Disabled: the new objective is
+                         # "reach the gate fast, regardless of body
+                         # orientation", so we don't penalise yaw
+                         # misalignment along the way.
+  k_speed: 0.0           # was 0.001. Disabled: rewarding forward body
+                         # velocity was pushing the policy toward an
+                         # "align then accelerate" strategy. We now want
+                         # the policy to pick its own approach style.
+  k_vertical: 0.005      # penalty on vertical speed: − k_vertical · |vz_body|/v_max
+  success_bonus: 100.0   # terminal, scaled by centering · time_factor
+                         # (see drone_goal_env.py _observe_step). The
+                         # speed factor and the body-yaw alignment factor
+                         # were removed — the new shape pays for "reach
+                         # the inner-opening center quickly" instead of
+                         # "cross fast".
+  # Distance-aware time budget for the terminal bonus. Each episode gets a
+  # per-spawn deadline computed from the straight-line spawn-to-target
+  # distance: far spawns get more steps to earn full bonus so the policy
+  # doesn't suicide on hopeless episodes; near spawns get a tight clock so
+  # the policy can't lazy-hover. The deadline (in env steps) is:
+  #     time_target = max(time_target_min,
+  #                       round(initial_distance · time_target_per_m))
+  # time_factor = 1.0 while step_idx ≤ time_target, then decays linearly
+  # to 0 by episode.max_steps.
+  # At control_hz=100, time_target_per_m=30 implies an "expected
+  # traversal speed" of ~3.3 m/s — well below v_max=20 m/s, so the
+  # policy has slack to plan a real path rather than fly geodesic at
+  # max speed. Lowering time_target_per_m tightens the race.
+  time_target_min:   100   # env steps; at 100 Hz = 1.0 s minimum
+  time_target_per_m: 30    # env steps per meter of initial distance
+  oob_penalty: 50.0      # workspace OOB (drone leaves the box relative to target)
+  crash_penalty: 5.0     # gate frame hit OR entering inner square from behind (-target_yaw)
 
-tolerance:
-  pos_tol: 0.20         # m  (xy distance to target for success)
+# Gate frame geometry (mirrors the PnP corner layout). Success fires when
+# the drone crosses the gate plane *through the inner square*. Crash (treated
+# as OOB) fires when it crosses through the annular frame (between inner and
+# outer edges).
+gate:
+  size_interior: 1.5    # m, square opening side length
+  size_exterior: 2.7    # m, square frame outer side length
+  depth_tol: 0.3        # m, "at the gate plane" threshold. Must exceed
+                        # v_max · dt / 2 so the cross is detected per step.
 
 episode:
-  max_steps: 300        # 30 s at 10 Hz
+  max_steps: 3000        # 30 s at 100 Hz (was 1500 at 50 Hz)

@@ -84,6 +84,18 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /rl/target_gate
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: TrackGates
+      Namespaces:
+        {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /rl/track_gates
+      Value: true
     - Alpha: 1
       Class: rviz_default_plugins/RobotModel
       Collision Enabled: false

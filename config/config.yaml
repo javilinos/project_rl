@@ -2,14 +2,18 @@
   # Global Parameters
   ros__parameters:
     tf_timeout_threshold: 0.05
+    use_sim_time: true
 
 /**:
   # Basic Robotics Functions
   platform:
     ros__parameters:
-      cmd_freq: 100.0  # Hz of platform commands send
+      cmd_freq: 500.0  # Hz of platform commands send
+      imu_pub_freq: 200.0
+      ground_truth_pub_freq: 200.0
+      odometry_pub_freq: 200.0
       # # Raw Odometry
-      # use_odom_for_control: true  # Use odometry for control instead of ground truth (default: false)
+      use_odom_for_control: false  # Use odometry for control instead of ground truth (default: false)
 
   # State Estimator
   state_estimator:

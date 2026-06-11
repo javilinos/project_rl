@@ -82,11 +82,17 @@ def _smoke_swarm(cfg_path: Path, namespaces: list[str], steps: int) -> None:
 
 
 def _check_observations(env: DroneGoalEnv, target_pos: np.ndarray) -> tuple[int, int]:
-    """Verify _get_obs() returns the 7-D body-frame state.
+    """Verify _get_obs() returns the body-frame state.
 
     obs[0..2]: body-frame relative position to target (xy / max_dist_xy, z / pos_max_z)
-    obs[3..5]: body-frame velocity (should be ≈0 after settling)
-    obs[6]:    (drone_yaw − target_yaw) wrapped to [-π, π], divided by π
+    obs[3..5]: body-frame velocity tanh-normalized by v_max (should be ≈0 after settling)
+    obs[6]:    bearing-to-target = atan2(rel_body_y, rel_body_x) divided by π.
+               0 → target directly ahead; ±1 → target directly behind;
+               +0.5 → target to the left; −0.5 → target to the right.
+               (Previously this slot held drone_yaw − target_yaw; that
+               changed when the reward stopped paying for gate-yaw
+               alignment — see _get_obs docstring.)
+    obs[7..8]: only in action.mode=rates — roll/(π/2), pitch/(π/2)
     """
     max_dist_xy = env._max_dist_xy
     pos_max_z = env._pos_max_z
@@ -188,23 +194,33 @@ def _check_reward_formula(env: DroneGoalEnv) -> tuple[int, int]:
 
 def _check_termination(env: DroneGoalEnv,
                        target_pos: np.ndarray) -> tuple[int, int]:
-    """Verify that success triggers on xy distance alone, and that the new
-    gate-crossing-style info fields are populated. The terminal bonus depends
-    on forward speed, which is ≈0 after teleport+settle, so it should be ~0
-    for all success cases here — that's expected, not a bug.
+    """Verify gate-frame termination logic:
+    - success: |depth| < depth_tol AND max(|lat|, |vert|) < inner_half
+    - crash (oob): |depth| < depth_tol AND inner_half ≤ max(|lat|, |vert|) < outer_half
+    Drone is teleported with zero velocity so the terminal speed factor is 0,
+    but `info['terminal_bonus']` must still be ≥ 0 and the success/oob/crash
+    flags must match expectations.
     """
     target_yaw = env._target_yaw
-    # (description, drone_pos, drone_yaw, expect_success)
-    cases: list[tuple[str, np.ndarray, float, bool]] = [
-        ('at target, aligned',        target_pos.copy(),                      target_yaw, True),
-        ('at target, yaw_err=π/2',    target_pos.copy(),                      target_yaw + math.pi / 2, True),
-        ('at target, yaw_err=-π/2',   target_pos.copy(),                      target_yaw - math.pi / 2, True),
-        ('far in x — no success',     target_pos + np.array([1.0, 0.0, 0.0]), target_yaw, False),
-        ('far in z still in xy_tol',  target_pos + np.array([0.0, 0.0, 0.6]), target_yaw, True),
+    gate = env.cfg['gate']
+    inner_half = float(gate['size_interior']) / 2.0  # 0.75
+    outer_half = float(gate['size_exterior']) / 2.0  # 1.35
+
+    # (description, drone_pos offset (world), drone_yaw, expect_success, expect_crash)
+    cases: list[tuple[str, np.ndarray, float, bool, bool]] = [
+        ('at gate centre',            np.array([0.0,  0.0, 0.0]), target_yaw, True,  False),
+        ('inner offset (lateral)',    np.array([0.0,  0.5, 0.0]), target_yaw, True,  False),
+        ('inner offset (vertical)',   np.array([0.0,  0.0, 0.5]), target_yaw, True,  False),
+        ('frame crash (lateral)',     np.array([0.0,  0.9, 0.0]), target_yaw, False, True),
+        ('frame crash (vertical)',    np.array([0.0,  0.0, 1.0]), target_yaw, False, True),
+        ('far in front of gate',      np.array([1.5,  0.0, 0.0]), target_yaw, False, False),
+        ('past the gate (depth>tol)', np.array([-1.5, 0.0, 0.0]), target_yaw, False, False),
+        ('outside frame (lateral)',   np.array([0.0,  1.5, 0.0]), target_yaw, False, False),
     ]
 
     n_pass = 0
-    for desc, drone_pos, drone_yaw, expect_success in cases:
+    for desc, offset, drone_yaw, expect_success, expect_crash in cases:
+        drone_pos = target_pos + offset
         env._step_idx = 0
         env._last_action = np.zeros(4, dtype=np.float32)
         env._teleport(drone_pos, drone_yaw)
@@ -213,8 +229,12 @@ def _check_termination(env: DroneGoalEnv,
 
         _, reward, terminated, _, info = env._observe_step()
         got_success = bool(info.get('success', False))
-        terminated_ok = bool(terminated) == expect_success
+        got_crash = bool(info.get('crash', False))
+        expect_terminated = expect_success or expect_crash
+
         success_ok = got_success == expect_success
+        crash_ok = got_crash == expect_crash
+        terminated_ok = bool(terminated) == expect_terminated
         if expect_success:
             fields_ok = all(
                 k in info for k in
@@ -224,15 +244,22 @@ def _check_termination(env: DroneGoalEnv,
             fields_ok = True
             bonus_ok = True
 
-        ok = success_ok and terminated_ok and fields_ok and bonus_ok
+        ok = success_ok and crash_ok and terminated_ok and fields_ok and bonus_ok
         n_pass += int(ok)
+        outcome = ('success' if got_success
+                   else 'crash' if got_crash
+                   else 'continue')
+        expected = ('success' if expect_success
+                    else 'crash' if expect_crash
+                    else 'continue')
         print(
             f'[{" OK " if ok else "FAIL"}] {desc:<28s} '
-            f'success={got_success}/{expect_success} '
-            f'term={terminated} '
-            f"bonus={info.get('terminal_bonus', 0.0):+.2f} "
-            f'reward={reward:+.2f}'
+            f'got={outcome:<8s} expected={expected:<8s} '
+            f"depth={info.get('gate_depth', float('nan')):+.2f} "
+            f"lat={info.get('gate_lateral', float('nan')):+.2f} "
+            f"vert={info.get('gate_vertical', float('nan')):+.2f}"
         )
+    _ = inner_half, outer_half  # silence unused vars (kept for clarity)
     return n_pass, len(cases)
 
 
@@ -285,6 +312,156 @@ def _check_reset_on_success(env: DroneGoalEnv,
     return n_pass, len(checks)
 
 
+def _gate_side_flight(env: DroneGoalEnv, target_pos: np.ndarray,
+                      start_offset: np.ndarray, drone_yaw: float,
+                      action: np.ndarray, label: str,
+                      max_steps: int = 100) -> None:
+    """Fly the drone from a known start with a fixed action; stream the
+    reward + state breakdown at every step until termination.
+    """
+    rw = env.cfg['reward']
+    k_pos = float(rw['k_pos'])
+    k_height = float(rw['k_height'])
+    k_bearing = float(rw['k_bearing'])
+    k_yaw_align = float(rw['k_yaw_align'])
+    k_speed = float(rw['k_speed'])
+    k_vertical = float(rw['k_vertical'])
+    oob_pen = float(rw['oob_penalty'])
+    crash_pen = float(rw.get('crash_penalty', 0.0))
+
+    env._target_pos = target_pos.copy()
+    env._target_yaw = 0.0
+    env._step_idx = 0
+    env._last_action = np.zeros(4, dtype=np.float32)
+    env._teleport(target_pos + start_offset, drone_yaw)
+    env._send_speed_command(0.0, 0.0, 0.0, 0.0)
+    env._publish_gate_marker()   # refresh RViz to match this run
+    env._set_physics(True)
+    time.sleep(0.2)
+
+    print(f'\n--- {label} ---')
+    print(f'  start = target + {start_offset.tolist()}, '
+          f'drone_yaw={drone_yaw:+.2f}, action={action.tolist()}')
+    print('  step | depth   n·vel  dist_xy | r_pos    r_hgt    r_brg    '
+          'r_yaw    r_spd    r_vrt  | r_cont   r_term  r_total | flags')
+
+    total_reward = 0.0
+    for step in range(max_steps):
+        _, reward, terminated, truncated, info = env.step(action)
+        total_reward += reward
+
+        # Reconstruct continuous vs terminal split.
+        terminal_bonus = float(info.get('terminal_bonus', 0.0))
+        terminal_pen = 0.0
+        if info.get('crash'):
+            terminal_pen = -crash_pen
+        elif info.get('oob'):
+            terminal_pen = -oob_pen
+        r_cont = reward - terminal_bonus - terminal_pen
+        r_term = terminal_bonus + terminal_pen
+
+        # Each continuous reward component reconstructed from the normalized
+        # values the env stored in info. Sum should equal r_cont.
+        r_pos = -k_pos * float(info.get('dist_xy_norm', 0.0))
+        r_hgt = -k_height * float(info.get('z_err_norm', 0.0))
+        r_brg = -k_bearing * float(info.get('bearing_norm', 0.0))
+        r_yaw = -k_yaw_align * float(info.get('yaw_err_norm', 0.0))
+        r_spd = +k_speed * float(info.get('forward_speed_score', 0.0))
+        r_vrt = -k_vertical * float(info.get('vertical_speed_norm', 0.0))
+
+        # Signed gate_normal·vel from the drone's real world velocity.
+        vel_world = env._read_velocity()
+        gate_normal_dot_vel = (
+            math.cos(env._target_yaw) * vel_world[0]
+            + math.sin(env._target_yaw) * vel_world[1]
+        )
+
+        flags = []
+        if info.get('success'):
+            flags.append('SUCCESS')
+        if info.get('crash'):
+            flags.append('CRASH')
+        if info.get('back_entry'):
+            flags.append('back_entry')
+        if info.get('oob') and not info.get('crash'):
+            flags.append('OOB')
+        if truncated:
+            flags.append('timeout')
+
+        depth = float(info.get('gate_depth', float('nan')))
+        dist_xy = float(info.get('dist_xy', float('nan')))
+        print(
+            f'  [{step:3d}] {depth:+6.3f} {gate_normal_dot_vel:+6.3f} '
+            f'{dist_xy:6.3f} | '
+            f'{r_pos:+7.4f} {r_hgt:+7.4f} {r_brg:+7.4f} '
+            f'{r_yaw:+7.4f} {r_spd:+7.4f} {r_vrt:+7.4f} | '
+            f'{r_cont:+7.4f} {r_term:+7.2f} {reward:+7.3f} | '
+            f"{' '.join(flags)}"
+        )
+
+        if terminated or truncated:
+            break
+
+    print(f'  episode total reward = {total_reward:+.3f}')
+
+
+def _check_gate_entry_side(env: DroneGoalEnv, target_pos: np.ndarray) -> None:
+    """Probe the gate entrance: fly the drone from several start poses with
+    a fixed action and stream the reward breakdown so you can see at which
+    point success or crash fires, and how the continuous reward evolves.
+
+    With ``target_yaw = 0`` the gate normal is +x. Legit forward crossing
+    means world velocity has a +x component; legit approach side is -x.
+    """
+    print('\n=== Gate entry side flight probe ===')
+    print(f'  target_pos = {target_pos.tolist()}, target_yaw = 0.0  '
+          '→ legit cross = +x, legit approach side has gate_depth > 0')
+
+    # Scenario A: -x side, command body-forward = world +x. Should reach the
+    # gate plane with positive n·vel → SUCCESS.
+    _gate_side_flight(
+        env, target_pos,
+        start_offset=np.array([-3.0, 0.0, 0.0]),
+        drone_yaw=0.0,
+        action=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        label='A: legit approach (-x side, body +forward)',
+    )
+
+    # Scenario B: +x side, command body-forward = world +x. Body-forward goes
+    # AWAY from the gate; gate_depth grows, drone should hit OOB eventually
+    # without ever crossing.
+    _gate_side_flight(
+        env, target_pos,
+        start_offset=np.array([3.0, 0.0, 0.0]),
+        drone_yaw=0.0,
+        action=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        label='B: wrong side, body +forward = away from gate',
+    )
+
+    # Scenario C: +x side, drone faces -x (yaw=π) and commands body-forward.
+    # That sends it toward the gate, but in the -x world direction →
+    # gate_normal·vel < 0 → CRASH back_entry when it reaches the opening.
+    _gate_side_flight(
+        env, target_pos,
+        start_offset=np.array([3.0, 0.0, 0.0]),
+        drone_yaw=math.pi,
+        action=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        label='C: back-entry (drone yaw=π, body +forward = world -x)',
+    )
+
+    # Leave drone parked on the legit approach side for the user to inspect
+    # the gate's decoration in RViz.
+    legit_pos = target_pos + np.array([-3.0, 0.0, 0.0])
+    env._teleport(legit_pos, 0.0)
+    env._send_speed_command(0.0, 0.0, 0.0, 0.0)
+    env._publish_gate_marker()
+    print(f'\n  drone parked at {legit_pos.tolist()} facing +x — look at RViz:')
+    print('    the gate decoration should be on the -x side facing the drone.')
+    print('    if it is on the +x side, the +π in _publish_gate_marker is '
+          'flipping it the wrong way.')
+    time.sleep(3.0)
+
+
 def _smoke_state_test(cfg_path: Path) -> None:
     """Run observation, reward-formula, termination/yaw-bonus, and
     reset-on-success checks against a single DroneGoalEnv instance.
@@ -306,6 +483,10 @@ def _smoke_state_test(cfg_path: Path) -> None:
         p_term, t_term = _check_termination(env, target_pos)
         print('\n=== reset on success tests ===')
         p_res, t_res = _check_reset_on_success(env, target_pos)
+
+        # Diagnostic-only probe (no pass/fail counts) so the user can both
+        # read the synthetic outcomes and look at RViz at the same time.
+        _check_gate_entry_side(env, target_pos)
 
         total_pass = p_obs + p_rew + p_term + p_res
         total = t_obs + t_rew + t_term + t_res

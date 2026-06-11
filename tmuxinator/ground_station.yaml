@@ -4,11 +4,23 @@ drone_namespace = @settings["drone_namespace"]
 keyboard_teleop = @settings["keyboard_teleop"] == "true"
 rviz            = @settings["rviz"] == "true"
 rosbag          = @settings["rosbag"] == "true"
+# Optional: pin the whole ground station (RViz + alphanumeric viewer) to a
+# specific ROS_DOMAIN_ID — useful when each drone was launched on its own
+# domain via `launch_as2.bash -d <base>` and you want to focus on one drone.
+ros_domain_id   = @settings["ros_domain_id"].to_s
+# When true, the rviz pane runs utils/rviz_select.bash instead of a single
+# fixed RViz instance. The selector is an interactive menu that kills/relaunches
+# RViz on the chosen drone's ROS_DOMAIN_ID. Use with -d <base> so the script
+# knows the starting domain.
+selector_mode   = @settings["selector_mode"] == "true"
 %>
 
 name: ground_station
 attach: false
 root: ./
+<% if !ros_domain_id.empty? %>
+pre_window: export ROS_DOMAIN_ID=<%= ros_domain_id %>
+<% end %>
 windows:
 
   # Mission monitoring
@@ -30,10 +42,14 @@ windows:
             namespace:=<%= drone_namespace %>
       <%- end %>
       <%- if rviz %>
+      <%- if selector_mode %>
+        - utils/rviz_select.bash <%= ros_domain_id.empty? ? "0" : ros_domain_id %> <%= drone_namespace %>
+      <%- else %>
         - ros2 launch as2_visualization swarm_viz.launch.py
             namespace_list:=<%= drone_namespace %>
             rviz_config:=config_ground_station/rviz2_config.rviz
             drone_model:=quadrotor_base
+      <%- end %>
       <%- end %>
       <%- if rosbag %>
         - ./rosbag/record_rosbag.bash <%= drone_namespace %>

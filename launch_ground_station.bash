@@ -8,6 +8,8 @@ usage() {
     echo "      -r: record rosbag. Default not launch"
     echo "      -n: drone namespaces, comma separated. Default get from world description config file"
     echo "      -g: launch using gnome-terminal instead of tmux. Default not set"
+    echo "      -d: ROS_DOMAIN_ID to observe. RViz and the alphanumeric viewer will only see drones on this domain. Use to focus on a single drone trained with per-drone DDS isolation."
+    echo "      -s: launch the per-drone RViz selector (utils/rviz_select.bash). -d sets the base domain; one drone is shown at a time, swap with the menu."
 }
 
 # Initialize variables with default values
@@ -17,9 +19,16 @@ rviz="true"
 rosbag="false"
 drones_namespace_comma=""
 use_gnome="false"
+# Empty = inherit the parent shell's ROS_DOMAIN_ID. Set to a specific value to
+# pin this ground station (rviz + viewer) to one drone's DDS domain.
+ros_domain_id=""
+# When set, the rviz pane runs the interactive selector instead of a single
+# fixed RViz instance. Pair with -d <base> and -n / -m so the selector knows
+# what to switch between.
+selector_mode="false"
 
 # Parse command line arguments
-while getopts "mtvrn:g" opt; do
+while getopts "mtvrn:gd:s" opt; do
   case ${opt} in
     m )
       swarm="true"
@@ -38,6 +47,12 @@ while getopts "mtvrn:g" opt; do
       ;;
     g )
       use_gnome="true"
+      ;;
+    d )
+      ros_domain_id="${OPTARG}"
+      ;;
+    s )
+      selector_mode="true"
       ;;
     \? )
       echo "Invalid option: -$OPTARG" >&2
@@ -81,6 +96,8 @@ eval "tmuxinator ${tmuxinator_mode} -n ground_station -p tmuxinator/ground_stati
   keyboard_teleop=${keyboard_teleop} \
   rviz=${rviz} \
   rosbag=${rosbag} \
+  ros_domain_id=${ros_domain_id} \
+  selector_mode=${selector_mode} \
   ${tmuxinator_end}"
 
 # Attach to tmux session
