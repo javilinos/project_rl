@@ -141,6 +141,23 @@ init_bounds:
   z_max:  2.5
 min_init_target_dist: 4.0  # m, in absolute world units
 
+# Exploring starts: randomize the drone's initial velocity and attitude at
+# each reset so the policy is forced to experience (and learn to control)
+# aggressive high-speed / high-tilt regimes from step 0, instead of always
+# starting from a gentle hover and overfitting to conservative maneuvers.
+# The drone's roll/pitch are visible in obs[7..8] (rates mode) and its
+# velocity in obs[3..5], so the policy can react. Set any *_max to 0 to
+# disable that axis; delete the whole block to spawn at rest & level (the
+# original behavior). Only used in rates mode in practice (speed mode's
+# motion controller would damp these out immediately).
+exploring_starts:
+  lin_vel_max: 12.0   # m/s; initial speed ∈ [0, lin_vel_max], random
+                      # isotropic direction (world frame). 12 m/s over the
+                      # ~1 s it takes to react ≈ 12 m, within the 11 m OOB
+                      # box — the drone has time to redirect before OOB.
+  tilt_max:     0.6   # rad (~34°); initial roll AND pitch each ∈ [−t, +t]
+  ang_vel_max:  2.0   # rad/s; initial body angular velocity per axis ∈ [−a, +a]
+
 reward:
   # All weights act on values pre-normalized to [0, 1]. Per-step weights
   # were halved when control_hz went 50 → 100: an episode now contains 2×
@@ -151,7 +168,20 @@ reward:
   # rescaled — they fire once per episode regardless of step rate.
   k_pos: 0.005           # distance penalty (xy)
   k_height: 0.005        # height penalty (|z|)
-  k_bearing: 0.005       # face-the-target penalty (|atan2(body_y, body_x)|/π)
+  k_bearing: 0.03        # face-the-target ("look at the gate") penalty:
+                         # − k_bearing · (|bearing|/π) · bearing_weight,
+                         # where bearing_weight fades the penalty out near
+                         # the gate (see bearing_fade_dist). Bumped 0.005 →
+                         # 0.03 so it's a meaningful fraction of the dense
+                         # progress reward (~0.1/step) instead of ~20× smaller
+                         # and ignored. Keeps the PnP camera on the gate
+                         # during the approach.
+  bearing_fade_dist: 2.5 # m. The bearing penalty scales by
+                         # min(1, dist_3d / bearing_fade_dist), so it's full
+                         # strength while approaching and fades to 0 within
+                         # this radius of the gate — the policy must look at
+                         # the gate on approach but may cross at any heading.
+                         # Set 0 to apply the bearing penalty uniformly.
   k_yaw_align: 0.0       # was 0.005. Disabled: the new objective is
                          # "reach the gate fast, regardless of body
                          # orientation", so we don't penalise yaw
@@ -161,27 +191,53 @@ reward:
                          # "align then accelerate" strategy. We now want
                          # the policy to pick its own approach style.
   k_vertical: 0.005      # penalty on vertical speed: − k_vertical · |vz_body|/v_max
+  # Dense progress reward: + k_progress · (prev_dist − curr_dist) meters
+  # (3D) each step. Gives the policy a strong dense gradient toward the gate
+  # so it doesn't rely solely on the sparse terminal bonus to find the gate.
+  # Sum telescopes to k_progress·(spawn_dist − final_dist) → potential-based
+  # (doesn't bias the path); the speed incentive still comes from the
+  # discount + the uncapped terminal time_factor. At k_progress=1.0 a 6 m
+  # approach contributes ~6 reward total vs success_bonus≈100 — a meaningful
+  # dense guide that the terminal still dominates. Per step at 10 m/s closing
+  # that's ~0.1/step, ~20× the other per-step shaping terms (intended: it
+  # should be the primary dense signal). Set 0 to disable.
+  k_progress: 1.0
   success_bonus: 100.0   # terminal, scaled by centering · time_factor
                          # (see drone_goal_env.py _observe_step). The
                          # speed factor and the body-yaw alignment factor
                          # were removed — the new shape pays for "reach
                          # the inner-opening center quickly" instead of
                          # "cross fast".
-  # Distance-aware time budget for the terminal bonus. Each episode gets a
-  # per-spawn deadline computed from the straight-line spawn-to-target
-  # distance: far spawns get more steps to earn full bonus so the policy
-  # doesn't suicide on hopeless episodes; near spawns get a tight clock so
-  # the policy can't lazy-hover. The deadline (in env steps) is:
-  #     time_target = max(time_target_min,
-  #                       round(initial_distance · time_target_per_m))
-  # time_factor = 1.0 while step_idx ≤ time_target, then decays linearly
-  # to 0 by episode.max_steps.
-  # At control_hz=100, time_target_per_m=30 implies an "expected
-  # traversal speed" of ~3.3 m/s — well below v_max=20 m/s, so the
-  # policy has slack to plan a real path rather than fly geodesic at
-  # max speed. Lowering time_target_per_m tightens the race.
-  time_target_min:   100   # env steps; at 100 Hz = 1.0 s minimum
-  time_target_per_m: 30    # env steps per meter of initial distance
+  # Distance-aware, UNBOUNDED-above speed factor for the terminal bonus.
+  # The factor is the average crossing speed expressed in units of
+  # `ref_speed`, so going faster always pays more with no upper cap —
+  # ref_speed is just where the factor equals 1.0, not a ceiling:
+  #     ref_steps   = max(time_target_min,
+  #                       initial_dist / ref_speed · control_hz)
+  #     time_factor = max(time_factor_min, ref_steps / steps_taken)
+  #                 = max(time_factor_min, avg_speed / ref_speed)
+  # Behaviour (with ref_speed=10 m/s at control_hz=100):
+  #   spawn 10 m, cross in 1.0 s (10 m/s avg) → 1.00
+  #   spawn 10 m, cross in 0.5 s (20 m/s avg) → 2.00   ← faster pays more
+  #   spawn 10 m, cross in 2.0 s ( 5 m/s avg) → 0.50
+  #   spawn  4 m, cross in 0.13 s (30 m/s avg) → 3.00
+  # Scaling by initial_dist keeps it fair across spawns (far spawns aren't
+  # hopeless, near spawns can't lazy-hover). The factor is bounded only by
+  # physics — the drone can't cross in fewer steps than the distance and
+  # its top speed allow.
+  #
+  # time_factor_min keeps a small reward for slow-but-successful crossings
+  # so the policy never prefers crashing over a slow arrival.
+  #
+  # time_factor_max (OPTIONAL, absent below = uncapped): set a number to
+  # re-introduce a soft ceiling if the uncapped variance destabilizes
+  # value learning. e.g. `time_factor_max: 3.0` caps the bonus at 3×.
+  ref_speed:       10.0    # m/s, speed at which time_factor == 1.0 (NOT a cap)
+  time_target_min:   20    # env steps; floor on ref_steps for near spawns
+                           # (at 100 Hz = 0.2 s; stops a tiny spawn distance
+                           # from making the unit reference degenerate)
+  time_factor_min:  0.1    # floor so a slow crossing still earns 0.1 · bonus
+  # time_factor_max: 3.0   # uncomment to cap the speed multiplier
   oob_penalty: 50.0      # workspace OOB (drone leaves the box relative to target)
   crash_penalty: 5.0     # gate frame hit OR entering inner square from behind (-target_yaw)
 
@@ -194,6 +250,14 @@ gate:
   size_exterior: 2.7    # m, square frame outer side length
   depth_tol: 0.3        # m, "at the gate plane" threshold. Must exceed
                         # v_max · dt / 2 so the cross is detected per step.
+  # Success-arming radius. A gate-plane terminal (success or crash) can
+  # only fire after the drone has been seen at least this far (3D) from the
+  # gate center since the last reset. Blocks phantom step-0 successes from
+  # the stale at-the-gate pose that lingers before a teleport propagates
+  # through the pose pipeline. Must sit between the gate footprint
+  # (~size_exterior/2 = 1.35 m) and min_init_target_dist (4.0 m) so every
+  # real approach arms it but the at-gate stale pose never does.
+  success_arm_radius: 2.0  # m
 
 episode:
   max_steps: 3000        # 30 s at 100 Hz (was 1500 at 50 Hz)

@@ -40,6 +40,25 @@ def _yaw_to_quat(yaw: float) -> tuple[float, float, float, float]:
     return (math.cos(half), 0.0, 0.0, math.sin(half))  # (w, x, y, z)
 
 
+def _euler_to_quat(roll: float, pitch: float,
+                   yaw: float) -> tuple[float, float, float, float]:
+    """ZYX (yaw→pitch→roll) intrinsic Euler to (w, x, y, z) quaternion.
+
+    Used by the exploring-starts teleport to spawn the drone at a random
+    roll/pitch attitude (not just yaw), so the policy is forced to learn
+    recovery / control from tilted states from step 0.
+    """
+    cr, sr = math.cos(0.5 * roll), math.sin(0.5 * roll)
+    cp, sp = math.cos(0.5 * pitch), math.sin(0.5 * pitch)
+    cy, sy = math.cos(0.5 * yaw), math.sin(0.5 * yaw)
+    return (
+        cr * cp * cy + sr * sp * sy,   # w
+        sr * cp * cy - cr * sp * sy,   # x
+        cr * sp * cy + sr * cp * sy,   # y
+        cr * cp * sy - sr * sp * cy,   # z
+    )
+
+
 class DroneGoalEnv(gym.Env):
     """Drive the drone to a randomized (x, y, z, yaw) target."""
 
@@ -198,6 +217,18 @@ class DroneGoalEnv(gym.Env):
         # something goes wrong; the real value is set in reset() before
         # the first _observe_step would consume it.
         self._initial_dist_to_target = 0.0
+        # Previous-step 3D distance to target, for the dense progress
+        # reward. Seeded to the spawn distance in reset() before the first
+        # _observe_step consumes it.
+        self._prev_dist_to_target = 0.0
+        # Success-arming latch. A gate-crossing success can only fire after
+        # the drone has been observed clearly OUTSIDE the gate plane since
+        # the last reset. Without this, the first post-reset observation —
+        # which can still read the previous episode's at-the-gate pose
+        # before the teleport propagates through the pose pipeline (the
+        # gate is pinned at the same world point every episode) — fires a
+        # phantom success at step 0. Reset to False in reset().
+        self._success_armed = False
 
         # Single source of truth for both the observation normalization
         # divisors AND the OOB box: symmetric half-extents around the
@@ -357,10 +388,17 @@ class DroneGoalEnv(gym.Env):
         # Record the straight-line spawn-to-target distance BEFORE teleport
         # so the time-budget computation in _observe_step uses the actual
         # initial spawn pose, not whatever the drone drifted to mid-episode.
-        # Used by the terminal time_factor in the success bonus.
+        # Used by the terminal time_factor in the success bonus, and as the
+        # seed for the dense progress reward's previous-distance tracker.
         self._initial_dist_to_target = float(
             np.linalg.norm(init_pos - self._target_pos))
-        self._teleport(init_pos, init_yaw)
+        self._prev_dist_to_target = self._initial_dist_to_target
+        # Exploring starts: spawn already moving / tilted so the policy must
+        # learn aggressive-regime control from step 0.
+        es_roll, es_pitch, es_lin_vel, es_ang_vel = (
+            self._sample_exploring_start())
+        self._teleport(init_pos, init_yaw, roll=es_roll, pitch=es_pitch,
+                       lin_vel=es_lin_vel, ang_vel=es_ang_vel)
 
         # Re-issue a zero-effort hold so the platform's "last reference"
         # tracks the just-teleported pose. Mode-specific:
@@ -384,6 +422,11 @@ class DroneGoalEnv(gym.Env):
         time.sleep(2.0 * self._dt)
 
         self._step_idx = 0
+        # Disarm success until the drone is seen outside the gate plane.
+        # _check_done arms it once abs(gate_depth) >= depth_tol, so a stale
+        # first observation that still reads the drone at the gate cannot
+        # register a phantom crossing.
+        self._success_armed = False
         return self._get_obs(), {
             'target_pos': self._target_pos.copy(),
             'target_yaw': self._target_yaw,
@@ -468,6 +511,20 @@ class DroneGoalEnv(gym.Env):
         z_err_norm = abs(float(rel_world[2])) / self._pos_max_z
         bearing_norm = abs(bearing) / math.pi
         yaw_err_norm = abs(yaw_err) / math.pi
+        # 3D distance to the gate center — reused by the dense progress
+        # reward below, and used here to distance-gate the bearing
+        # ("look at the gate") penalty. The face-the-gate requirement is
+        # full strength during the APPROACH and fades linearly to zero
+        # within `bearing_fade_dist` of the gate, so the policy must keep
+        # the gate in front of it while approaching (good for the PnP
+        # camera) but is free to cross at any heading/attitude.
+        curr_dist = float(np.linalg.norm(rel_world))
+        bearing_fade_dist = float(
+            self.cfg['reward'].get('bearing_fade_dist', 2.5))
+        bearing_weight = (
+            min(1.0, curr_dist / bearing_fade_dist)
+            if bearing_fade_dist > 0.0 else 1.0)
+        bearing_norm_weighted = bearing_norm * bearing_weight
         # Forward-speed score: proportional and signed — only positive forward
         # body velocity is rewarded. Reversing through the gate (vx_body < 0)
         # gives 0 regardless of |v|, blocking the "back into the goal" exploit.
@@ -510,13 +567,31 @@ class DroneGoalEnv(gym.Env):
             omni_speed_score = 0.0
 
         reward = self._compute_reward(
-            dist_xy_norm, z_err_norm, bearing_norm, yaw_err_norm,
+            dist_xy_norm, z_err_norm, bearing_norm_weighted, yaw_err_norm,
             forward_speed_score, vertical_speed_norm)
+
+        # Dense progress reward: + k_progress · (prev_dist − curr_dist) in
+        # meters (3D). Rewards closing distance to the gate every step, so
+        # the policy gets a strong dense gradient toward the gate instead of
+        # relying only on the sparse terminal bonus. The sum telescopes to
+        # k_progress·(initial_dist − final_dist), so it's potential-based
+        # (doesn't bias WHICH path) — the *speed* incentive comes from the
+        # discount (γ<1 front-loads progress, so faster = higher return) plus
+        # the uncapped terminal time_factor. Paired with exploring starts so
+        # the policy actually visits the fast trajectories this gradient
+        # points toward.
+        k_progress = float(self.cfg['reward'].get('k_progress', 0.0))
+        progress_reward = k_progress * (self._prev_dist_to_target - curr_dist)
+        reward += progress_reward
+        self._prev_dist_to_target = curr_dist
+
         terminated, truncated, info = self._check_done(
             pos, gate_depth, gate_lateral, gate_vertical,
             gate_normal_dot_vel)
         info.update({
             'dist_xy': dist_xy,
+            'dist_3d': curr_dist,
+            'progress_reward': progress_reward,
             'bearing': bearing,
             'yaw_err': yaw_err,
             'vel_body_x': vel_body_x,
@@ -525,6 +600,7 @@ class DroneGoalEnv(gym.Env):
             'dist_xy_norm': dist_xy_norm,
             'z_err_norm': z_err_norm,
             'bearing_norm': bearing_norm,
+            'bearing_weight': bearing_weight,
             'yaw_err_norm': yaw_err_norm,
             'forward_speed_score': forward_speed_score,
             'vertical_speed_norm': vertical_speed_norm,
@@ -544,16 +620,30 @@ class DroneGoalEnv(gym.Env):
             #     center of the inner opening the crossing was. Linear
             #     from 1 at center to 0 at the inner edge.
             #
-            #   time_factor — NEW. Full credit while step_idx ≤
-            #     time_target, then linearly decays to 0 at max_steps.
-            #     time_target is computed PER-SPAWN from the straight-line
-            #     spawn-to-target distance (see _initial_dist_to_target):
-            #         time_target = max(time_target_min,
-            #                           round(init_dist · time_target_per_m))
-            #     This is critical: a fixed time_target would suicide-
-            #     incentivise the policy on far-spawn episodes it can't
-            #     possibly reach in time. Scaling the budget by spawn
-            #     distance keeps the "race" honest for any starting pose.
+            #   time_factor — UNBOUNDED-above speed ratio: the policy is
+            #     rewarded in proportion to how fast it actually crossed,
+            #     with no upper saturation, so "go faster" always pays
+            #     more. `ref_speed` is just the unit reference at which the
+            #     factor equals 1.0 — NOT a cap:
+            #         ref_steps  = max(time_target_min,
+            #                          init_dist / ref_speed · control_hz)
+            #         time_factor = max(time_factor_min,
+            #                           ref_steps / steps_taken)
+            #     Since ref_steps / steps_taken == avg_speed / ref_speed,
+            #     the factor literally equals "how many times ref_speed you
+            #     averaged": cross at ref_speed → 1.0, at 2× ref_speed →
+            #     2.0, at 3× → 3.0, … bounded only by physics (you can't
+            #     take fewer steps than the distance allows). Scaling by
+            #     init_dist keeps it fair across spawns. The floor keeps a
+            #     small reward for slow-but-successful crossings.
+            #
+            #     NOTE: because this is uncapped, a lucky very-fast crossing
+            #     of a near gate can produce a large terminal bonus (e.g.
+            #     4 m gate at 30 m/s → factor 3 → 3·success_bonus). PPO's
+            #     advantage normalization absorbs moderate variance, but if
+            #     value learning destabilizes, set `time_factor_max` in the
+            #     config to re-introduce a soft ceiling (disabled when
+            #     absent / null).
             #
             #   (Dropped vs. prior versions: align_factor — body-yaw
             #    alignment with target_yaw; and speed_factor — crossing
@@ -566,18 +656,21 @@ class DroneGoalEnv(gym.Env):
             center_factor = max(0.0, 1.0 - center_distance / inner_half)
 
             reward_cfg = self.cfg['reward']
-            time_target_min = int(reward_cfg.get('time_target_min', 100))
-            time_target_per_m = float(reward_cfg.get('time_target_per_m', 30.0))
-            time_target = max(
-                time_target_min,
-                int(round(self._initial_dist_to_target * time_target_per_m)))
-            if self._step_idx <= time_target:
-                time_factor = 1.0
-            else:
-                decay_span = max(1, self._max_steps - time_target)
-                time_factor = max(
-                    0.0,
-                    1.0 - (self._step_idx - time_target) / float(decay_span))
+            ref_speed = float(reward_cfg.get('ref_speed', 10.0))
+            time_target_min = int(reward_cfg.get('time_target_min', 20))
+            time_factor_min = float(reward_cfg.get('time_factor_min', 0.1))
+            control_hz = float(self.cfg['control_hz'])
+            # Reference step count to fly init_dist straight at ref_speed,
+            # floored so a near spawn can't make the unit reference tiny.
+            ref_steps = max(
+                float(time_target_min),
+                self._initial_dist_to_target / ref_speed * control_hz)
+            steps_taken = max(1, self._step_idx)
+            time_factor = max(time_factor_min, ref_steps / steps_taken)
+            # Optional soft ceiling — absent / null in config means uncapped.
+            time_factor_max = reward_cfg.get('time_factor_max')
+            if time_factor_max is not None:
+                time_factor = min(float(time_factor_max), time_factor)
 
             bonus = (float(reward_cfg['success_bonus'])
                      * center_factor * time_factor)
@@ -590,15 +683,19 @@ class DroneGoalEnv(gym.Env):
             align_factor = max(0.0, 1.0 - yaw_err_norm)
             speed_factor = omni_speed_score
 
+            avg_speed = (self._initial_dist_to_target
+                         / (steps_taken / control_hz))
             print(f'{self.drone_namespace} success bonus={bonus:.2f} '
                   f'(center={center_factor:.2f}, time={time_factor:.2f} '
-                  f'@t={self._step_idx}/target={time_target}, '
-                  f'init_dist={self._initial_dist_to_target:.1f} m  '
+                  f'@t={self._step_idx} steps, '
+                  f'init_dist={self._initial_dist_to_target:.1f} m, '
+                  f'avg_speed={avg_speed:.1f} m/s vs ref {ref_speed:.0f}  '
                   f'| diag align={align_factor:.2f} '
                   f'speed={speed_factor:.2f})')
             info['center_factor'] = center_factor
             info['time_factor'] = time_factor
-            info['time_target'] = time_target
+            info['ref_steps'] = ref_steps
+            info['avg_speed'] = avg_speed
             info['initial_dist_to_target'] = self._initial_dist_to_target
             info['align_factor'] = align_factor   # diagnostic, not in bonus
             info['speed_factor'] = speed_factor   # diagnostic, not in bonus
@@ -697,19 +794,84 @@ class DroneGoalEnv(gym.Env):
             float(tc.get('yaw', 0.0)),
         )
 
-    def _teleport(self, position: np.ndarray, yaw: float) -> None:
+    def _sample_exploring_start(self):
+        """Sample a random initial attitude + velocity for exploring starts.
+
+        Returns ``(roll, pitch, lin_vel_world, ang_vel_body)``. Forces the
+        policy to experience aggressive high-speed / high-tilt regimes from
+        step 0 so it discovers that high pitch/roll → high speed (instead of
+        overfitting to the gentle-hover basin the conservative init biases
+        it toward). Returns all-zeros (≡ original behavior) when the
+        ``exploring_starts`` config block is absent or all maxima are 0.
+
+        - lin_vel: magnitude uniform in [0, lin_vel_max], random isotropic
+          direction (world frame). Random direction (not biased toward the
+          gate) is intentional — the point is broad coverage of fast states
+          and learning to redirect, not a head start.
+        - roll/pitch: each uniform in [-tilt_max, tilt_max].
+        - ang_vel: each axis uniform in [-ang_vel_max, ang_vel_max] (body).
+        """
+        es = self.cfg.get('exploring_starts')
+        if not es:
+            return 0.0, 0.0, None, None
+        rng = self.np_random
+        lin_vel_max = float(es.get('lin_vel_max', 0.0))
+        tilt_max = float(es.get('tilt_max', 0.0))
+        ang_vel_max = float(es.get('ang_vel_max', 0.0))
+
+        lin_vel = None
+        if lin_vel_max > 0.0:
+            speed = float(rng.uniform(0.0, lin_vel_max))
+            d = rng.normal(size=3)
+            n = float(np.linalg.norm(d))
+            d = d / n if n > 1e-9 else np.array([1.0, 0.0, 0.0])
+            lin_vel = speed * d
+
+        roll = float(rng.uniform(-tilt_max, tilt_max)) if tilt_max > 0 else 0.0
+        pitch = float(rng.uniform(-tilt_max, tilt_max)) if tilt_max > 0 else 0.0
+
+        ang_vel = None
+        if ang_vel_max > 0.0:
+            ang_vel = rng.uniform(-ang_vel_max, ang_vel_max, size=3)
+
+        return roll, pitch, lin_vel, ang_vel
+
+    def _teleport(self, position: np.ndarray, yaw: float,
+                  roll: float = 0.0, pitch: float = 0.0,
+                  lin_vel: np.ndarray | None = None,
+                  ang_vel: np.ndarray | None = None) -> None:
+        """Hot-teleport the simulator to a kinematic state.
+
+        roll/pitch default to 0 (yaw-only attitude, original behavior).
+        lin_vel (world frame, m/s) and ang_vel (body frame, rad/s) default
+        to zero. The exploring-starts path in reset() passes non-zero
+        values so the policy spawns already moving / tilted.
+        """
         req = SetPlatformState.Request()
         req.pose = Pose()
         req.pose.position.x = float(position[0])
         req.pose.position.y = float(position[1])
         req.pose.position.z = float(position[2])
-        qw, qx, qy, qz = _yaw_to_quat(yaw)
+        if roll == 0.0 and pitch == 0.0:
+            qw, qx, qy, qz = _yaw_to_quat(yaw)
+        else:
+            qw, qx, qy, qz = _euler_to_quat(roll, pitch, yaw)
         req.pose.orientation.w = qw
         req.pose.orientation.x = qx
         req.pose.orientation.y = qy
         req.pose.orientation.z = qz
-        req.linear_velocity = Vector3()
-        req.angular_velocity = Vector3()
+        lv = Vector3()
+        if lin_vel is not None:
+            lv.x = float(lin_vel[0])
+            lv.y = float(lin_vel[1])
+            lv.z = float(lin_vel[2])
+        req.linear_velocity = lv
+        av = Vector3()
+        if ang_vel is not None:
+            av.x = float(ang_vel[0])
+            av.y = float(ang_vel[1])
+            av.z = float(ang_vel[2])
+        req.angular_velocity = av
         req.reset_to_hover = False
 
         future = self._set_state_client.call_async(req)
@@ -1010,7 +1172,29 @@ class DroneGoalEnv(gym.Env):
         outer_half = float(gate['size_exterior']) / 2.0
         depth_tol = float(gate['depth_tol'])
 
+        # Arm all gate-plane terminals once the drone is clearly AWAY from
+        # the gate center (3D distance, not just off the plane). Any real
+        # approach from a >= min_init_target_dist spawn must pass through
+        # this shell, so it always arms; meanwhile a stale at-the-gate pose
+        # after reset (dist ≈ 0) never arms. Using 3D distance rather than
+        # |gate_depth| also handles the ~3%-of-episodes case where the drone
+        # spawns inside the plane slab but laterally far — |depth| would be
+        # small there and never arm, but the 3D distance is large.
+        # arm_radius must satisfy: gate footprint < arm_radius <
+        # min_init_target_dist, so it sits between "at the gate" and "at
+        # spawn".
+        arm_radius = float(gate.get('success_arm_radius', 2.0))
+        dist_to_gate = float(np.linalg.norm(drone_pos - self._target_pos))
+        if dist_to_gate >= arm_radius:
+            self._success_armed = True
+
         if abs(gate_depth) < depth_tol:
+            # In the plane slab but not yet armed → stale-pose phantom.
+            # Suppress ALL gate terminals (success AND crash) and let the
+            # episode continue so the real spawn pose can propagate.
+            if not self._success_armed:
+                info['phantom_suppressed'] = True
+                return False, False, info
             in_plane_max = max(abs(gate_lateral), abs(gate_vertical))
             if in_plane_max < inner_half:
                 if gate_normal_dot_vel > 0.0:
