@@ -23,6 +23,17 @@ control_hz: 100.0     # Hz. Each env step represents 1/control_hz of sim
 takeoff_height: 1.5
 takeoff_speed: 1.0
 
+# Deployment PnP camera geometry. Modeled as fixed, pitched `pitch_deg`
+# forward/UP from body +x (FPV-style uptilt: optical axis = [cos, 0, +sin]).
+# Drives the full-3D camera pointing — the camera-frame azimuth/elevation
+# obs channels (obs[6]/[7]) and the roll-invariant off-axis "look at the
+# gate" pointing penalty — so any roll/pitch/yaw that aims the camera at the
+# gate is credited (a banked attitude pointing at the gate scores as well as
+# a level one). With uptilt, pitching nose-down to fly fast also rotates the
+# camera toward a level gate ahead, so speed and camera-aim reinforce.
+camera:
+  pitch_deg: 30.0
+
 training:
   # Vectorized env backend: "subproc" runs one DroneGoalEnv per subprocess
   # (true parallelism, recommended for >2 drones). "dummy" runs all envs in
@@ -54,11 +65,11 @@ action:
                         # bound for rates-mode drone speeds; raising it
                         # stretches the tanh's "fast vs cruise" boundary
                         # and the speed-bonus saturation point.
-  yaw_rate_max: 8.0  # rad/s (= pi) (speed mode only)
+  yaw_rate_max: 3.0  # rad/s (= pi) (speed mode only)
   rates:                # used only when mode == "rates"
-    roll_rate_max:  16.0   # rad/s, per-axis body-rate limit
-    pitch_rate_max: 16.0
-    yaw_rate_max:   8.0
+    roll_rate_max:  12.0   # rad/s, per-axis body-rate limit
+    pitch_rate_max: 12.0
+    yaw_rate_max:   12.0
     # Thrust in Newtons. Hover thrust for the 1 kg UAV is ~9.81 N; the
     # multirotor model in uav_config.yaml puts the per-motor saturation
     # at ~9.2 N (= 4 × 9.2 ≈ 37 N total max).
@@ -71,10 +82,10 @@ action:
     # actually hovers instead of climbing (which would happen if we used
     # the linear midpoint of [thrust_min, thrust_max]).
     thrust_min:    0.0    # N
-    thrust_hover:  9.81   # N — set to vehicle_mass · g for the UAV in
+    thrust_hover:  9.94   # N — set to vehicle_mass · g for the UAV in
                           # uav_config.yaml. If you change the mass there,
                           # re-tune this so action[3]=0 actually hovers.
-    thrust_max:   30.0    # N
+    thrust_max:   40.0    # N
 
 
 # Episode terminates if drone leaves this box.
@@ -139,24 +150,30 @@ init_bounds:
   y_max:  9.0
   z_min:  -2.5
   z_max:  2.5
-min_init_target_dist: 4.0  # m, in absolute world units
+min_init_target_dist: 2.0  # m, in absolute world units
 
 # Exploring starts: randomize the drone's initial velocity and attitude at
 # each reset so the policy is forced to experience (and learn to control)
 # aggressive high-speed / high-tilt regimes from step 0, instead of always
 # starting from a gentle hover and overfitting to conservative maneuvers.
-# The drone's roll/pitch are visible in obs[7..8] (rates mode) and its
+# The drone's roll/pitch are visible in obs[9..10] (rates mode) and its
 # velocity in obs[3..5], so the policy can react. Set any *_max to 0 to
 # disable that axis; delete the whole block to spawn at rest & level (the
 # original behavior). Only used in rates mode in practice (speed mode's
 # motion controller would damp these out immediately).
 exploring_starts:
-  lin_vel_max: 12.0   # m/s; initial speed ∈ [0, lin_vel_max], random
-                      # isotropic direction (world frame). 12 m/s over the
-                      # ~1 s it takes to react ≈ 12 m, within the 11 m OOB
-                      # box — the drone has time to redirect before OOB.
-  tilt_max:     0.6   # rad (~34°); initial roll AND pitch each ∈ [−t, +t]
-  ang_vel_max:  2.0   # rad/s; initial body angular velocity per axis ∈ [−a, +a]
+  lin_vel_max: 0.0   # m/s; initial speed ∈ [0, lin_vel_max], random
+                      # isotropic direction (world frame), then per-axis
+                      # capped by OOB margin (see min_reaction_time).
+  tilt_max:     0.0   # rad (~34°); initial roll AND pitch each ∈ [−t, +t]
+  ang_vel_max:  0.0   # rad/s; initial body angular velocity per axis ∈ [−a, +a]
+  min_reaction_time: 0.5  # s. Cap each injected velocity component so the
+                      # drone keeps at least this long before crossing the
+                      # nearest OOB face on that axis, given its spawn
+                      # position. Removes unfair "launched out of bounds at
+                      # the boundary edge before it can recover" spawns
+                      # without trimming inward/tangential velocity. Set 0
+                      # to disable the cap (raw isotropic velocity).
 
 reward:
   # All weights act on values pre-normalized to [0, 1]. Per-step weights
@@ -167,21 +184,18 @@ reward:
   # scale unchanged. Terminal-event rewards (success/oob/crash) are NOT
   # rescaled — they fire once per episode regardless of step rate.
   k_pos: 0.005           # distance penalty (xy)
-  k_height: 0.005        # height penalty (|z|)
-  k_bearing: 0.03        # face-the-target ("look at the gate") penalty:
-                         # − k_bearing · (|bearing|/π) · bearing_weight,
-                         # where bearing_weight fades the penalty out near
-                         # the gate (see bearing_fade_dist). Bumped 0.005 →
-                         # 0.03 so it's a meaningful fraction of the dense
-                         # progress reward (~0.1/step) instead of ~20× smaller
-                         # and ignored. Keeps the PnP camera on the gate
-                         # during the approach.
-  bearing_fade_dist: 2.5 # m. The bearing penalty scales by
-                         # min(1, dist_3d / bearing_fade_dist), so it's full
-                         # strength while approaching and fades to 0 within
-                         # this radius of the gate — the policy must look at
-                         # the gate on approach but may cross at any heading.
-                         # Set 0 to apply the bearing penalty uniformly.
+  k_height: 0.01        # height penalty (|z|)
+  k_bearing: 0.03        # "look at the gate" pointing penalty:
+                         # − k_bearing · pointing_norm,
+                         # where pointing_norm = (camera off-axis angle)/π —
+                         # the roll-INVARIANT 3D angle between the PnP camera
+                         # optical axis and the line-of-sight to the gate
+                         # (full attitude). Any roll/pitch/yaw that centers
+                         # the gate in frame scores well. Applied at FULL
+                         # strength for the whole episode (no distance fade),
+                         # so the policy keeps the gate centered all the way
+                         # to and through the crossing. 0.03 is a meaningful
+                         # fraction of the dense progress reward (~0.1/step).
   k_yaw_align: 0.0       # was 0.005. Disabled: the new objective is
                          # "reach the gate fast, regardless of body
                          # orientation", so we don't penalise yaw
@@ -190,7 +204,7 @@ reward:
                          # velocity was pushing the policy toward an
                          # "align then accelerate" strategy. We now want
                          # the policy to pick its own approach style.
-  k_vertical: 0.005      # penalty on vertical speed: − k_vertical · |vz_body|/v_max
+  k_vertical: 0.0      # penalty on vertical speed: − k_vertical · |vz_body|/v_max
   # Dense progress reward: + k_progress · (prev_dist − curr_dist) meters
   # (3D) each step. Gives the policy a strong dense gradient toward the gate
   # so it doesn't rely solely on the sparse terminal bonus to find the gate.
@@ -202,12 +216,22 @@ reward:
   # that's ~0.1/step, ~20× the other per-step shaping terms (intended: it
   # should be the primary dense signal). Set 0 to disable.
   k_progress: 1.0
-  success_bonus: 100.0   # terminal, scaled by centering · time_factor
+  success_bonus: 100.0   # terminal, scaled by center_factor · time_factor
                          # (see drone_goal_env.py _observe_step). The
                          # speed factor and the body-yaw alignment factor
                          # were removed — the new shape pays for "reach
-                         # the inner-opening center quickly" instead of
-                         # "cross fast".
+                         # the gate center fast".
+  center_factor_min: 0.5 # Floor for the centering factor: an inner-edge
+                         # crossing earns this share (center → 1.0,
+                         # edge → center_factor_min) instead of dropping to
+                         # 0. At 0.8 the centering multiplier only swings 20%
+                         # (0.8→1.0), so it's a gentle nudge toward dead-centre
+                         # while the time_factor (0.1→3.0, a 30× swing) is the
+                         # dominant driver — the policy is meant to optimise
+                         # SPEED first and centre only when ~free (e.g. bank
+                         # through from the side rather than waste time
+                         # aligning). Lower it toward 0.5/0.0 to make centring
+                         # matter more again; 1.0 = centring irrelevant.
   # Distance-aware, UNBOUNDED-above speed factor for the terminal bonus.
   # The factor is the average crossing speed expressed in units of
   # `ref_speed`, so going faster always pays more with no upper cap —
@@ -229,15 +253,26 @@ reward:
   # time_factor_min keeps a small reward for slow-but-successful crossings
   # so the policy never prefers crashing over a slow arrival.
   #
+  # time_factor_exp steepens the speed ratio: time_factor = (avg_speed /
+  # ref_speed) ** time_factor_exp (before the floor). exp>1 rewards fast
+  # crossings super-linearly AND penalises slow ones harder — e.g. at
+  # exp=1.5: 2× ref_speed → 2.83 (was 2.0), 0.5× ref_speed → 0.35 (was
+  # 0.5). exp=1.0 is the plain linear ratio.
+  #
   # time_factor_max (OPTIONAL, absent below = uncapped): set a number to
   # re-introduce a soft ceiling if the uncapped variance destabilizes
   # value learning. e.g. `time_factor_max: 3.0` caps the bonus at 3×.
   ref_speed:       10.0    # m/s, speed at which time_factor == 1.0 (NOT a cap)
+  time_factor_exp:  1.5    # >1 rewards fast / penalises slow super-linearly
   time_target_min:   20    # env steps; floor on ref_steps for near spawns
                            # (at 100 Hz = 0.2 s; stops a tiny spawn distance
                            # from making the unit reference degenerate)
   time_factor_min:  0.1    # floor so a slow crossing still earns 0.1 · bonus
-  # time_factor_max: 3.0   # uncomment to cap the speed multiplier
+  time_factor_max:  3.0    # cap the speed multiplier: an uncapped time_factor
+                           # rewards unbounded dive speed, which drives reckless
+                           # overshoot/frame-clipping near the gate. 3.0 still
+                           # pays 3× for a 3×-ref_speed crossing but stops the
+                           # variance blowup. Comment out to go uncapped again.
   oob_penalty: 50.0      # workspace OOB (drone leaves the box relative to target)
   crash_penalty: 5.0     # gate frame hit OR entering inner square from behind (-target_yaw)
 

@@ -117,12 +117,12 @@ def main() -> None:
             # revisit the matching set together — they're tied.
             gamma=0.9995,
             vf_coef=0.5,
-            learning_rate=3e-5,
+            learning_rate=1e-4,
             ent_coef=0.001,
             use_sde=True,
             sde_sample_freq=24,
             policy_kwargs=dict(
-                log_std_init=-3.2,
+                log_std_init=-2.5,
                 ortho_init=True,
                 activation_fn=torch.nn.ReLU,
                 net_arch=dict(pi=[256, 256, 128], vf=[256, 256, 128])

@@ -86,13 +86,13 @@ def _check_observations(env: DroneGoalEnv, target_pos: np.ndarray) -> tuple[int,
 
     obs[0..2]: body-frame relative position to target (xy / max_dist_xy, z / pos_max_z)
     obs[3..5]: body-frame velocity tanh-normalized by v_max (should be ≈0 after settling)
-    obs[6]:    bearing-to-target = atan2(rel_body_y, rel_body_x) divided by π.
-               0 → target directly ahead; ±1 → target directly behind;
-               +0.5 → target to the left; −0.5 → target to the right.
-               (Previously this slot held drone_yaw − target_yaw; that
-               changed when the reward stopped paying for gate-yaw
-               alignment — see _get_obs docstring.)
-    obs[7..8]: only in action.mode=rates — roll/(π/2), pitch/(π/2)
+    obs[6..8]: camera LOS unit vector [fwd, right, up] in the camera frame —
+               where the gate sits in view; continuous on the sphere (no atan2
+               wrap when the gate passes behind).
+    obs[9]:    speed mode only — relative yaw (drone_yaw − target_yaw) / π.
+    obs[9..14]: rates mode only — 6D continuous rotation (first two columns of
+               the gate→body rotation matrix; attitude relative to the stable
+               gate frame, also encodes gate facing / which-side).
     """
     max_dist_xy = env._max_dist_xy
     pos_max_z = env._pos_max_z

@@ -23,10 +23,11 @@ import yaml
 from as2_python_api.drone_interface_teleop import DroneInterfaceTeleop
 from as2_msgs.msg import ControlMode, Thrust
 from as2_msgs.srv import SetControlMode, SetPlatformState
-from geometry_msgs.msg import Pose, TwistStamped, Vector3
+from geometry_msgs.msg import Pose, PoseStamped, TwistStamped, Vector3
 from gymnasium import spaces
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from std_srvs.srv import SetBool
 from visualization_msgs.msg import Marker
 
@@ -57,6 +58,85 @@ def _euler_to_quat(roll: float, pitch: float,
         cr * sp * cy + sr * cp * sy,   # y
         cr * cp * sy - sr * sp * cy,   # z
     )
+
+
+def _quat_to_rotmat(qw: float, qx: float, qy: float,
+                    qz: float) -> np.ndarray:
+    """Body→world rotation matrix R_wb from a (w, x, y, z) attitude quaternion.
+
+    Used as the SINGLE attitude source for the observation geometry (camera
+    pointing + 6D rotation). Sourcing R_wb from the quaternion — rather than
+    reconstructing it from euler roll/pitch/yaw — is exact and singularity-free
+    (no ±90° pitch gimbal fold). Falls back to identity for a degenerate
+    (zero-norm) quaternion.
+    """
+    n = math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
+    if n < 1e-12:
+        return np.eye(3)
+    qw, qx, qy, qz = qw / n, qx / n, qy / n, qz / n
+    return np.array([
+        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+        [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+        [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
+    ])
+
+
+def _camera_pointing(rel_world: np.ndarray, R_wb: np.ndarray,
+                     camera_pitch: float) -> tuple[np.ndarray, float]:
+    """Where the gate sits in the PnP camera, from the body→world rotation R_wb.
+
+    Returns ``(los_cam, cam_off_axis)``:
+      - los_cam      — the gate line-of-sight as a UNIT vector in the camera
+                       basis: ``[fwd, right, up]`` (forward = optical axis,
+                       right = image right, up = image up). Continuous on the
+                       sphere — no atan2 wrap when the gate passes 90°/behind.
+      - cam_off_axis — angle between the optical axis and the line-of-sight
+                       (= acos(fwd)). ROLL-INVARIANT (only "how centered"); any
+                       attitude that aims the camera at the gate scores 0.
+
+    ``rel_world`` is the gate position relative to the drone in world ENU. The
+    camera is rigidly mounted, optical axis pitched ``camera_pitch`` UP from
+    body +x (FPV uptilt): f = [cos c, 0, +sin c] in FLU, image right = body −y,
+    image up = [−sin c, 0, cos c]. {f, −y, u} is orthonormal, so [fwd,right,up]
+    is a unit vector.
+    """
+    rel_world = np.asarray(rel_world, dtype=np.float64)
+    n_los = float(np.linalg.norm(rel_world))
+    los_b = (R_wb.T @ (rel_world / n_los)
+             if n_los > 1e-9 else np.array([1.0, 0.0, 0.0]))
+    c = camera_pitch
+    f_cam = np.array([math.cos(c), 0.0, math.sin(c)])    # forward + up
+    u_cam = np.array([-math.sin(c), 0.0, math.cos(c)])   # image up
+    fwd = float(np.dot(los_b, f_cam))
+    right = float(-los_b[1])                             # · [0, -1, 0]
+    up = float(np.dot(los_b, u_cam))
+    cam_off_axis = math.acos(max(-1.0, min(1.0, fwd)))   # roll-invariant
+    return np.array([fwd, right, up]), cam_off_axis
+
+
+def _rotation_6d(R_wb: np.ndarray, target_yaw: float) -> np.ndarray:
+    """Continuous 6D encoding of the drone's attitude relative to the GATE FRAME
+    (Zhou et al. 2019, "On the Continuity of Rotation Representations").
+
+    Returns the first two columns of the gate→body rotation, i.e. the gate
+    frame's x-axis (crossing normal) and y-axis (left) expressed in the body
+    frame — 6 numbers, each in [-1, 1].
+
+    R_gate_body = Rz(−target_yaw) · R_wb. The reference is the gate's STABLE
+    per-episode orientation, so this rotation changes only when the drone
+    actually rotates — never with its position (unlike a line-of-sight / bearing
+    reference, which spins as the drone moves and is singular AT the gate). It is
+    yaw-RELATIVE (uses target_yaw, not absolute world yaw → no heading leak) and,
+    being relative to the gate, it also encodes the gate facing / which-side.
+    Built from R_wb (quaternion-sourced) so it is fully continuous: no ±180° yaw
+    wrap (cos/sin), roll unique through inversion, no ±90° pitch gimbal. The
+    third gate axis (up) is the cross product of the two columns.
+    """
+    ct, st = math.cos(target_yaw), math.sin(target_yaw)
+    rz_neg = np.array([[ct, st, 0.0], [-st, ct, 0.0], [0.0, 0.0, 1.0]])  # Rz(−ψ)
+    r_gate_body = rz_neg @ R_wb                  # body → gate
+    r_body_gate = r_gate_body.T                  # gate → body (cols = gate axes in body)
+    return np.concatenate([r_body_gate[:, 0], r_body_gate[:, 1]])  # 6 numbers
 
 
 class DroneGoalEnv(gym.Env):
@@ -97,6 +177,20 @@ class DroneGoalEnv(gym.Env):
         self._svc_thread = threading.Thread(
             target=self._svc_executor.spin, daemon=True)
         self._svc_thread.start()
+
+        # Cache the latest attitude quaternion (w, x, y, z) straight off
+        # self_localization/pose — the SAME PoseStamped DroneInterface consumes,
+        # but keeping the quaternion (DroneInterface throws it away as euler).
+        # Used to build a singularity-free body→world rotation for the
+        # observation geometry (camera pointing + 6D attitude). The
+        # _svc_executor thread writes; step()/reset() read (atomic tuple
+        # rebind, no lock needed). None until the first pose arrives → R_wb
+        # falls back to euler (see _read_rotation). Match the publisher's
+        # sensor-data QoS or messages are dropped on the floor.
+        self._latest_quat: tuple[float, float, float, float] | None = None
+        self._pose_quat_sub = self._svc_node.create_subscription(
+            PoseStamped, f'/{self.drone_namespace}/self_localization/pose',
+            self._pose_quat_callback, qos_profile_sensor_data)
 
         self._set_state_client = self._svc_node.create_client(
             SetPlatformState,
@@ -140,10 +234,10 @@ class DroneGoalEnv(gym.Env):
                 f"{self._action_mode!r}.")
         if self._action_mode == 'rates':
             rates_cfg = action_cfg.get('rates') or {}
-            self._roll_rate_max = float(rates_cfg.get('roll_rate_max', 4.0))
-            self._pitch_rate_max = float(rates_cfg.get('pitch_rate_max', 4.0))
+            self._roll_rate_max = float(rates_cfg.get('roll_rate_max', 22.0))
+            self._pitch_rate_max = float(rates_cfg.get('pitch_rate_max', 22.0))
             self._yaw_rate_max_rates = float(rates_cfg.get(
-                'yaw_rate_max', math.pi))
+                'yaw_rate_max', 22.0))
             self._thrust_min = float(rates_cfg.get('thrust_min', 0.0))
             self._thrust_max = float(rates_cfg.get('thrust_max', 30.0))
             # Hover thrust = vehicle mass × g; sets the zero-action thrust
@@ -180,15 +274,31 @@ class DroneGoalEnv(gym.Env):
             self._twist_pub = None
             self._set_mode_client = None
 
-        # Observation:
-        #   speed mode (7-D): body-frame relative position to target (3) +
-        #     body-frame drone velocity (3) + relative yaw / π (1).
-        #   rates mode (9-D): the speed-mode 7-D + roll/(π/2) + pitch/(π/2).
-        #     The extra attitude channels let the policy condition rate
-        #     commands on the current tilt so it can learn attitude→velocity
-        #     coupling and stay self-stabilising — speed-mode policies got
-        #     that for free from the underlying motion controller.
-        self._obs_dim = 10 if self._action_mode == 'rates' else 8
+        # Observation (shared 9-D core: body-frame relative position to target
+        # (3) + body-frame drone velocity (3) + camera LOS unit vector
+        # [fwd,right,up] (3)), then mode-specific. ALL channels are continuous /
+        # singularity-free:
+        #   speed mode (10-D): core + relative yaw / π (1). The motion controller
+        #     handles attitude, so only relative heading matters.
+        #   rates mode (15-D): core + a 6D continuous rotation (6). The 6D
+        #     (first two columns of the gate→body rotation, Zhou et al. 2019)
+        #     encodes the drone's attitude relative to the GATE FRAME — a stable
+        #     per-episode reference, so it changes only when the drone rotates,
+        #     never with its position (a line-of-sight reference spins as the
+        #     drone moves and is singular AT the gate). Being gate-relative it
+        #     also carries the gate facing / which-side. Singularity-free
+        #     (quaternion-sourced): no ±180° yaw wrap, no ±90° pitch gimbal,
+        #     roll unique through inversion. The camera uvec replaces the old
+        #     atan2 azimuth/elevation (which jumped when the gate passed behind).
+        #     See `_rotation_6d` / `_camera_pointing`.
+        self._obs_dim = 15 if self._action_mode == 'rates' else 10
+        # Camera mount tilt (forward/UP from body +x; FPV uptilt), radians.
+        # Drives the full-3D camera pointing: the camera-frame azimuth/
+        # elevation obs channels and the roll-invariant off-axis pointing
+        # penalty, so "look at the gate" accounts for the whole attitude
+        # (roll included), not just yaw azimuth + pitch elevation.
+        self._camera_pitch = math.radians(
+            float(self.cfg.get('camera', {}).get('pitch_deg', 30.0)))
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
         self.observation_space = spaces.Box(
@@ -396,7 +506,7 @@ class DroneGoalEnv(gym.Env):
         # Exploring starts: spawn already moving / tilted so the policy must
         # learn aggressive-regime control from step 0.
         es_roll, es_pitch, es_lin_vel, es_ang_vel = (
-            self._sample_exploring_start())
+            self._sample_exploring_start(init_pos))
         self._teleport(init_pos, init_yaw, roll=es_roll, pitch=es_pitch,
                        lin_vel=es_lin_vel, ang_vel=es_ang_vel)
 
@@ -511,20 +621,21 @@ class DroneGoalEnv(gym.Env):
         z_err_norm = abs(float(rel_world[2])) / self._pos_max_z
         bearing_norm = abs(bearing) / math.pi
         yaw_err_norm = abs(yaw_err) / math.pi
-        # 3D distance to the gate center — reused by the dense progress
-        # reward below, and used here to distance-gate the bearing
-        # ("look at the gate") penalty. The face-the-gate requirement is
-        # full strength during the APPROACH and fades linearly to zero
-        # within `bearing_fade_dist` of the gate, so the policy must keep
-        # the gate in front of it while approaching (good for the PnP
-        # camera) but is free to cross at any heading/attitude.
+        # "Look at the gate" pointing error: the roll-INVARIANT off-axis angle
+        # between the PnP camera optical axis and the HORIZONTAL line-of-sight
+        # to the gate (cam_off_axis_reward, vertical LOS zeroed in
+        # _compute_state). Using the horizontal LOS makes this an ATTITUDE-only
+        # term — the drone must PITCH/roll/yaw to aim, and cannot satisfy it by
+        # descending below the gate. Any roll/pitch/yaw that swings the camera
+        # onto the gate's bearing scores well (a banked attitude is as good as a
+        # level one). Normalized by π (aimed → 0, 90° off → 0.5, behind → 1.0).
+        pointing_norm = min(s.cam_off_axis_reward / math.pi, 1.0)
+        # 3D distance to the gate center — reused by the dense progress reward.
         curr_dist = float(np.linalg.norm(rel_world))
-        bearing_fade_dist = float(
-            self.cfg['reward'].get('bearing_fade_dist', 2.5))
-        bearing_weight = (
-            min(1.0, curr_dist / bearing_fade_dist)
-            if bearing_fade_dist > 0.0 else 1.0)
-        bearing_norm_weighted = bearing_norm * bearing_weight
+        # "Look at the gate" pointing penalty applies at FULL strength for the
+        # whole episode (no distance fade): the policy must keep the gate
+        # centered the entire approach and through the crossing.
+        pointing_norm_weighted = pointing_norm
         # Forward-speed score: proportional and signed — only positive forward
         # body velocity is rewarded. Reversing through the gate (vx_body < 0)
         # gives 0 regardless of |v|, blocking the "back into the goal" exploit.
@@ -567,19 +678,17 @@ class DroneGoalEnv(gym.Env):
             omni_speed_score = 0.0
 
         reward = self._compute_reward(
-            dist_xy_norm, z_err_norm, bearing_norm_weighted, yaw_err_norm,
+            dist_xy_norm, z_err_norm, pointing_norm_weighted, yaw_err_norm,
             forward_speed_score, vertical_speed_norm)
 
         # Dense progress reward: + k_progress · (prev_dist − curr_dist) in
-        # meters (3D). Rewards closing distance to the gate every step, so
-        # the policy gets a strong dense gradient toward the gate instead of
-        # relying only on the sparse terminal bonus. The sum telescopes to
+        # meters (3D). Rewards closing distance to the gate every step, so the
+        # policy gets a strong dense gradient toward the gate instead of relying
+        # only on the sparse terminal bonus. The sum telescopes to
         # k_progress·(initial_dist − final_dist), so it's potential-based
-        # (doesn't bias WHICH path) — the *speed* incentive comes from the
-        # discount (γ<1 front-loads progress, so faster = higher return) plus
-        # the uncapped terminal time_factor. Paired with exploring starts so
-        # the policy actually visits the fast trajectories this gradient
-        # points toward.
+        # (doesn't bias WHICH path) — the speed incentive comes from the
+        # discount (γ<1 front-loads progress) plus the uncapped terminal
+        # time_factor.
         k_progress = float(self.cfg['reward'].get('k_progress', 0.0))
         progress_reward = k_progress * (self._prev_dist_to_target - curr_dist)
         reward += progress_reward
@@ -600,7 +709,10 @@ class DroneGoalEnv(gym.Env):
             'dist_xy_norm': dist_xy_norm,
             'z_err_norm': z_err_norm,
             'bearing_norm': bearing_norm,
-            'bearing_weight': bearing_weight,
+            'cam_azimuth': s.cam_azimuth,
+            'cam_elevation': s.cam_elevation,
+            'cam_off_axis': s.cam_off_axis,
+            'pointing_norm': pointing_norm,
             'yaw_err_norm': yaw_err_norm,
             'forward_speed_score': forward_speed_score,
             'vertical_speed_norm': vertical_speed_norm,
@@ -650,12 +762,19 @@ class DroneGoalEnv(gym.Env):
             #    velocity magnitude. Both pushed the policy toward "align
             #    then accelerate" strategies. We now want "reach the
             #    center fast, however you want to get there".)
+            reward_cfg = self.cfg['reward']
             inner_half = float(self.cfg['gate']['size_interior']) / 2.0
             center_distance = math.sqrt(
                 gate_lateral ** 2 + gate_vertical ** 2)
-            center_factor = max(0.0, 1.0 - center_distance / inner_half)
-
-            reward_cfg = self.cfg['reward']
+            # Floor the center factor so an off-center crossing still earns
+            # `center_factor_min` of the centering credit instead of being
+            # driven to 0 at the inner edge. Centering still matters (center
+            # → 1.0) but no longer dominates the bonus, leaving room for the
+            # steeper time_factor to make speed the primary driver.
+            center_factor_min = float(reward_cfg.get('center_factor_min', 0.5))
+            raw_center = max(0.0, 1.0 - center_distance / inner_half)
+            center_factor = (
+                center_factor_min + (1.0 - center_factor_min) * raw_center)
             ref_speed = float(reward_cfg.get('ref_speed', 10.0))
             time_target_min = int(reward_cfg.get('time_target_min', 20))
             time_factor_min = float(reward_cfg.get('time_factor_min', 0.1))
@@ -666,7 +785,15 @@ class DroneGoalEnv(gym.Env):
                 float(time_target_min),
                 self._initial_dist_to_target / ref_speed * control_hz)
             steps_taken = max(1, self._step_idx)
-            time_factor = max(time_factor_min, ref_steps / steps_taken)
+            # Speed ratio == avg_speed / ref_speed. A configurable exponent
+            # steepens the curve symmetrically around 1.0: with exp>1, fast
+            # crossings (ratio>1) are rewarded super-linearly AND slow ones
+            # (ratio<1) are pushed down harder — both "reward fast" and
+            # "penalize slow" at once. exp=1.0 reproduces the linear form.
+            ratio = ref_steps / steps_taken
+            time_factor_exp = float(reward_cfg.get('time_factor_exp', 1.0))
+            time_factor = ratio ** time_factor_exp
+            time_factor = max(time_factor_min, time_factor)
             # Optional soft ceiling — absent / null in config means uncapped.
             time_factor_max = reward_cfg.get('time_factor_max')
             if time_factor_max is not None:
@@ -771,9 +898,9 @@ class DroneGoalEnv(gym.Env):
         If ``target_bounds`` is present in the config, the target is sampled
         uniformly from that box (with yaw in [yaw_min, yaw_max]). Otherwise
         falls back to the fixed ``target`` block — back-compat for fixed-goal
-        evaluation. With target sampling enabled, ``obs[6] = (yaw -
-        target_yaw)/π`` finally becomes a load-bearing relative-yaw signal
-        instead of an alias for the world heading.
+        evaluation. With target sampling enabled, the relative-yaw obs channel
+        (drone_yaw − target_yaw)/π becomes a load-bearing signal instead of an
+        alias for the world heading.
         """
         tb = self.cfg.get('target_bounds')
         if tb is not None:
@@ -794,7 +921,7 @@ class DroneGoalEnv(gym.Env):
             float(tc.get('yaw', 0.0)),
         )
 
-    def _sample_exploring_start(self):
+    def _sample_exploring_start(self, init_pos: np.ndarray):
         """Sample a random initial attitude + velocity for exploring starts.
 
         Returns ``(roll, pitch, lin_vel_world, ang_vel_body)``. Forces the
@@ -807,9 +934,15 @@ class DroneGoalEnv(gym.Env):
         - lin_vel: magnitude uniform in [0, lin_vel_max], random isotropic
           direction (world frame). Random direction (not biased toward the
           gate) is intentional — the point is broad coverage of fast states
-          and learning to redirect, not a head start.
+          and learning to redirect, not a head start. Each axis component is
+          then capped so the drone keeps at least ``min_reaction_time``
+          seconds before crossing the nearest OOB face on that axis (given
+          ``init_pos``) — this removes the unwinnable spawns where a drone
+          launched near the boundary is OOB before it can possibly recover,
+          while leaving inward/tangential velocity untouched.
         - roll/pitch: each uniform in [-tilt_max, tilt_max].
         - ang_vel: each axis uniform in [-ang_vel_max, ang_vel_max] (body).
+          Not capped — angular velocity doesn't drive translational OOB.
         """
         es = self.cfg.get('exploring_starts')
         if not es:
@@ -818,6 +951,7 @@ class DroneGoalEnv(gym.Env):
         lin_vel_max = float(es.get('lin_vel_max', 0.0))
         tilt_max = float(es.get('tilt_max', 0.0))
         ang_vel_max = float(es.get('ang_vel_max', 0.0))
+        min_reaction_time = float(es.get('min_reaction_time', 0.5))
 
         lin_vel = None
         if lin_vel_max > 0.0:
@@ -826,6 +960,16 @@ class DroneGoalEnv(gym.Env):
             n = float(np.linalg.norm(d))
             d = d / n if n > 1e-9 else np.array([1.0, 0.0, 0.0])
             lin_vel = speed * d
+            # Cap each component by the OOB margin in its direction so the
+            # drone always has >= min_reaction_time to correct before OOB.
+            if min_reaction_time > 0.0:
+                offset = np.asarray(init_pos, dtype=np.float64) - self._target_pos
+                ext = (self._oob_x_ext, self._oob_y_ext, self._oob_z_ext)
+                for i in range(3):
+                    margin = (ext[i] - offset[i] if lin_vel[i] > 0.0
+                              else ext[i] + offset[i])
+                    v_cap = max(0.0, float(margin)) / min_reaction_time
+                    lin_vel[i] = float(np.clip(lin_vel[i], -v_cap, v_cap))
 
         roll = float(rng.uniform(-tilt_max, tilt_max)) if tilt_max > 0 else 0.0
         pitch = float(rng.uniform(-tilt_max, tilt_max)) if tilt_max > 0 else 0.0
@@ -1006,6 +1150,23 @@ class DroneGoalEnv(gym.Env):
         yaw = float(self.drone.orientation[2])
         return pos, yaw
 
+    def _pose_quat_callback(self, msg: PoseStamped) -> None:
+        """Cache the attitude quaternion from self_localization/pose (the same
+        topic DroneInterface uses, but keeping the quaternion)."""
+        q = msg.pose.orientation
+        self._latest_quat = (q.w, q.x, q.y, q.z)
+
+    def _read_rotation(self) -> np.ndarray:
+        """Body→world rotation R_wb. Prefers the cached attitude quaternion
+        (exact, singularity-free); falls back to reconstructing it from the
+        DroneInterface euler if no pose has arrived yet (startup gap), which
+        matches the previous euler-based behaviour during that window."""
+        q = self._latest_quat
+        if q is not None:
+            return _quat_to_rotmat(q[0], q[1], q[2], q[3])
+        roll, pitch, yaw = (float(a) for a in self.drone.orientation)
+        return _quat_to_rotmat(*_euler_to_quat(roll, pitch, yaw))
+
     def _read_velocity(self) -> np.ndarray:
         """World-frame linear velocity.
 
@@ -1059,12 +1220,36 @@ class DroneGoalEnv(gym.Env):
         # forward". The bearing channel stays useful even when the
         # position obs[0..1] saturate to ±1 at far distances; the angle
         # is exact regardless of how far the target is.
-        bearing = math.atan2(rel_body_y, rel_body_x)
+        bearing = math.atan2(rel_body_y, rel_body_x)  # yaw-only azimuth (diag)
         # Roll / pitch only consumed by the rates-mode observation. Reading
         # them unconditionally keeps the state namespace uniform between
         # modes (debug code can rely on s.roll / s.pitch always existing).
         roll = float(self.drone.orientation[0])
         pitch = float(self.drone.orientation[1])
+        # Body→world rotation from the cached attitude QUATERNION (singularity-
+        # free; see _read_rotation). Single attitude source for the camera
+        # pointing and the 6D rotation below.
+        r_wb = self._read_rotation()
+        # Camera line-of-sight as a UNIT vector in the camera basis
+        # [fwd, right, up] — continuous everywhere (no atan2 wrap when the gate
+        # passes 90°/behind), goes straight into the obs. Plus the roll-invariant
+        # off-axis angle for the reward. See `_camera_pointing`.
+        los_cam, cam_off_axis = _camera_pointing(
+            rel_world, r_wb, self._camera_pitch)
+        cam_azimuth = math.atan2(los_cam[1], los_cam[0])   # diag only (from uvec)
+        cam_elevation = math.atan2(los_cam[2], los_cam[0])  # diag only (from uvec)
+        # Pointing error used by the REWARD is computed against the HORIZONTAL
+        # line-of-sight (vertical component of rel_world zeroed). This makes the
+        # "look at the gate" reward a function of ATTITUDE only: to shrink it the
+        # drone must PITCH (plus yaw/roll) to swing the up-tilted optical axis
+        # onto the gate's horizontal bearing. Changing z-position does NOT move
+        # the horizontal LOS, so the policy can no longer satisfy the camera by
+        # flying BELOW the gate (the descend exploit) — it must tilt. (Roll
+        # credit is preserved: still the full-3-D off-axis, just vs a horizontal
+        # target.)
+        rel_world_h = np.array([rel_world[0], rel_world[1], 0.0])
+        _, cam_off_axis_reward = _camera_pointing(
+            rel_world_h, r_wb, self._camera_pitch)
         obs_list = [
             np.clip(rel_body_x / self._pos_max_x, -1.0, 1.0),
             np.clip(rel_body_y / self._pos_max_y, -1.0, 1.0),
@@ -1079,17 +1264,27 @@ class DroneGoalEnv(gym.Env):
             np.tanh(vel_body_x / v_max),
             np.tanh(vel_body_y / v_max),
             np.tanh(vel_body_z / v_max),
-            bearing / math.pi,
-            yaw_rel / math.pi,
+            # Gate line-of-sight unit vector in the camera frame [fwd, right,
+            # up]: continuous on the sphere (no wrap), tells the policy where the
+            # gate is in frame; the reward penalizes the off-axis angle acos(fwd).
+            float(los_cam[0]),
+            float(los_cam[1]),
+            float(los_cam[2]),
         ]
         if self._action_mode == 'rates':
-            # Normalize by π/2 so ±1 saturates at ±90° tilt — the edge of
-            # the recoverable envelope. 45° → 0.5 (good resolution in the
-            # normal flight regime). Clip handles inverted (>90°) states.
-            obs_list.extend([
-                np.clip(_wrap_to_pi(roll) / (0.5 * math.pi), -1.0, 1.0),
-                np.clip(_wrap_to_pi(pitch) / (0.5 * math.pi), -1.0, 1.0),
-            ])
+            # 6D continuous rotation: the drone's attitude relative to the GATE
+            # FRAME (first two columns of the gate→body rotation). The reference
+            # is the gate's stable per-episode orientation, so this changes only
+            # when the drone rotates — never with its position (a line-of-sight
+            # reference spins as the drone moves and is singular AT the gate).
+            # Singularity-free (quaternion-sourced): no yaw wrap, no inversion
+            # ambiguity, no pitch gimbal. Being gate-relative, it ALSO carries
+            # the gate facing / which-side, so no separate facing channel is
+            # needed. See `_rotation_6d`.
+            obs_list.extend(_rotation_6d(r_wb, self._target_yaw).tolist())
+        else:
+            # Speed mode doesn't control attitude; only relative heading matters.
+            obs_list.append(yaw_rel / math.pi)
         obs = np.array(obs_list, dtype=np.float32)
         return SimpleNamespace(
             obs=obs,
@@ -1109,22 +1304,26 @@ class DroneGoalEnv(gym.Env):
             v_max=v_max,
             yaw_rel=yaw_rel,
             bearing=bearing,
+            cam_azimuth=cam_azimuth,
+            cam_elevation=cam_elevation,
+            cam_off_axis=cam_off_axis,
+            cam_off_axis_reward=cam_off_axis_reward,
+            los_cam=los_cam,
         )
 
     def _get_obs(self) -> np.ndarray:
-        """Body-frame observation. Dimensionality depends on action.mode:
-          speed (7-D): (body_x, body_y, body_z) to target, (vx, vy, vz) in
-            body frame, and the bearing-to-target = atan2(rel_body_y,
-            rel_body_x) wrapped to [-π, π] and normalized by π.
-          rates (9-D): same 7 channels + roll/(π/2) + pitch/(π/2). The
-            attitude channels saturate at ±1 at ±90° tilt; 45° → 0.5.
-
-        Note: obs[6] used to be the *yaw alignment* error (drone yaw vs
-        gate yaw) when the reward paid for facing the gate's forward
-        direction at crossing. With the "reach the gate fast regardless
-        of orientation" reward redesign, that signal is no longer
-        relevant — the policy needs to know where the target is *relative
-        to its current nose direction*, which is exactly the bearing.
+        """Body-frame observation. Dimensionality depends on action.mode.
+        Shared core [0..8]: [0..2] (body_x, body_y, body_z) to target;
+          [3..5] (vx, vy, vz) tanh-normalized by v_max; [6..8] camera LOS unit
+          vector [fwd, right, up] in the camera frame (gate direction in view;
+          continuous on the sphere — no atan2 wrap when the gate goes behind).
+        Then:
+          speed (10-D): + [9] relative yaw (drone − target) / π.
+          rates (15-D): + [9..14] 6D continuous rotation — the first two columns
+            of the gate→body rotation matrix (gate's normal & left axes in the
+            body frame; attitude relative to the stable gate frame, also carries
+            gate facing / which-side, quaternion-sourced and discontinuity-free).
+            See `_rotation_6d` / `_camera_pointing`.
         """
         return self._compute_state().obs
 
