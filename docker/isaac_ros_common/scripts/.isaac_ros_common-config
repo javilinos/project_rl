@@ -1,0 +1,11 @@
+PROJECT_DIR="/home/cvar/Documents/project_aerostack2"
+PROJECT_NAME="aerostack2"
+AS2_WS="/ssd/aerostack2_ws/"
+PSDK_WS="/ssd/psdk_ws/"
+
+
+# `.estimator` appended (before `.start`): OpenCV-CUDA + cv_bridge rebuild +
+# fake-PnP/gate-localization deps for project_estimator. Remove it for a lighter
+# image if you don't need the gate-localization estimator. See Dockerfile.estimator.
+CONFIG_IMAGE_KEY="ros2_humble.user.as2.rl_frontiers.estimator.start"
+CONFIG_DOCKER_SEARCH_DIRS=(docker)

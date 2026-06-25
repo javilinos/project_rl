@@ -1,0 +1,25 @@
+# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto.  Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+USER root
+
+# Install compressed-image-transport, wget, and fetch tmux config in one layer
+RUN apt-get update --allow-insecure-repositories \
+    && apt-get install -y --no-install-recommends wget ros-humble-compressed-image-transport \
+    && rm -rf /var/lib/apt/lists/* \
+    && wget https://raw.githubusercontent.com/aerostack2/as2_flight_tools/main/configs/.tmux.conf -O /root/.tmux.conf
+
+# Copy entrypoint scripts
+COPY scripts/*entrypoint.sh /usr/local/bin/scripts/
+
+# Set default working directory
+WORKDIR /root
+

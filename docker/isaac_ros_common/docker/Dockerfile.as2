@@ -1,0 +1,91 @@
+# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto.  Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+USER root
+
+# Clean old kitware repos, install system dependencies, ROS tools, and add zenoh repo
+RUN rm -rf /var/lib/apt/lists/* && \
+rm -f /etc/apt/sources.list.d/yarn.list && \
+apt-key del 23E7166788B63E1E && \
+apt-get clean && \
+apt-get update --allow-releaseinfo-change
+
+RUN apt-get update --allow-insecure-repositories \
+    && apt-get install -y --no-install-recommends \
+       ros-dev-tools ros-humble-rmw-cyclonedds-cpp \
+       bridge-utils net-tools libaio-dev tmux tmuxinator \
+       ros-humble-ament-cmake \
+    && apt-get update
+
+# Install Python tools
+RUN python3 -m pip install -U pysimplegui tk vcstool pymap3d
+
+# Setup Aerostack2 workspace and build
+RUN mkdir -p /root/aerostack2_ws/src/thirdparty \
+    && cd /root/aerostack2_ws/src \
+    && mv /usr/local/include/google/protobuf /usr/local/include/google/protobuf.bak \
+    && ldconfig \
+    && git clone -b main https://github.com/aerostack2/aerostack2.git \
+    && git clone -b humble-devel https://github.com/MOCAP4ROS2-Project/mocap4r2_msgs.git thirdparty/mocap4r2_msgs \
+    && git clone https://github.com/aerostack2/as2_platform_dji_psdk.git aerostack2/as2_aerial_platforms/as2_platform_dji_psdk \
+    && cd /root/aerostack2_ws \
+    && source /opt/ros/humble/setup.bash \
+    && apt-get update \
+    && rosdep update \
+    && rosdep install -y -r -q --from-paths src --ignore-src \
+    && apt-get remove ignition-fortress -y \
+    && apt remove ignition* -y \
+    && apt remove ros-humble-ros-gz* -y \
+    && apt-get install -y curl \
+    && apt install lsb-release -y \
+    && apt install gnupg -y
+
+RUN curl https://packages.osrfoundation.org/gazebo.gpg --output /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] https://packages.osrfoundation.org/gazebo/ubuntu-stable $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/gazebo-stable.list > /dev/null \    
+    && apt-get update \
+    && rm -rf /usr/local/include/google/protobuf \
+    && rm -f /usr/local/lib/libprotobuf*.so* \
+    && rm -f /usr/local/lib/libprotobuf-lite*.so* \
+    && rm -f /usr/local/lib/libprotoc*.so* \
+    && rm -rf /usr/local/lib/cmake/protobuf \
+    && rm -f /usr/local/bin/protoc \
+    && apt install libprotobuf-lite23 -y \
+    && ldconfig \
+    && apt-get install gz-harmonic -y \
+    && apt-get install ros-humble-ros-gzharmonic -y \
+    && apt install ros-humble-ros-gzharmonic-bridge -y \
+    && apt install libgz-msgs10-dev -y \
+    && apt install libgz-transport13-dev -y \
+    && apt install libgz-sim8-dev -y
+    
+RUN cd /root/aerostack2_ws \
+    && source /opt/ros/humble/setup.bash \
+    && colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+# Setup PSDK workspace and build
+RUN mkdir -p /root/psdk_ws/src \
+    && cd /root/psdk_ws/src \
+    && git clone -b 1.3.2 https://github.com/umdlife/psdk_ros2.git \
+    && cd /root/psdk_ws \
+    && source /opt/ros/humble/setup.bash \
+    && rosdep install -y -r -q --from-paths src --ignore-src \
+    && source /opt/ros/humble/setup.bash \
+    && colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+# Persist environment setup in .bashrc
+RUN { \
+      echo 'source /opt/ros/humble/setup.bash'; \
+      echo 'export AEROSTACK2_PATH=$HOME/aerostack2_ws/src/aerostack2'; \
+      echo 'source $AEROSTACK2_PATH/as2_cli/setup_env.bash'; \
+      echo 'source /root/psdk_ws/install/setup.bash'; \
+    } >> /root/.bashrc
+
+WORKDIR /root/aerostack2_ws

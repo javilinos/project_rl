@@ -1,0 +1,41 @@
+# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto.  Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+WORKDIR /root/Downloads
+#install python dependencies for NN
+
+RUN python3 -m pip install -U onnx
+RUN wget https://nvidia.box.com/shared/static/iizg3ggrtdkqawkmebbfixo7sce6j365.whl -O onnxruntime_gpu-1.16.0-cp38-cp38-linux_aarch64.whl
+RUN python3 -m pip install -U onnxruntime_gpu-1.16.0-cp38-cp38-linux_aarch64.whl
+                                                        
+RUN apt-get install -y python3-pip libopenblas-dev
+
+ENV TORCH_INSTALL="https://developer.download.nvidia.com/compute/redist/jp/v512/pytorch/torch-2.1.0a0+41361538.nv23.06-cp38-cp38-linux_aarch64.whl"
+
+RUN python3 -m pip install --upgrade pip; python3 -m pip install numpy; python3 -m pip install --no-cache $TORCH_INSTALL
+RUN echo 'export LD_LIBRARY_PATH=/usr/lib/llvm-8/lib:$LD_LIBRARY_PATH' >> ~/.bashrc
+
+RUN apt update 
+RUN apt install libcusparse-dev-11-4 -y
+RUN apt install libcusolver-dev-11-4 -y
+RUN apt install libcublas-dev-11-4 -y
+RUN apt install libcufft-dev-11-4 -y
+RUN apt install libcurand-dev-11-4 -y
+
+WORKDIR /root
+ENV FORCE_CUDA=1
+
+COPY /cuda/torchvision-0.16.2.linux-aarch64.zip /root/Downloads/
+WORKDIR /root/Downloads
+RUN unzip torchvision-0.16.2.linux-aarch64.zip
+RUN rm -rf /usr/local/lib/python3.8/dist-packages/torchvision*
+RUN cp /root/Downloads/usr/lib/python3.8/site-packages/* /usr/local/lib/python3.8/dist-packages/ -R
+

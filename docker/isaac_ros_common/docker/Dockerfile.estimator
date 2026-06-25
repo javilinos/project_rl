@@ -1,0 +1,65 @@
+# Isaac-ROS layer: gate-localization / fake-PnP estimator stack.
+#
+# Appended to the image-key chain (e.g. CONFIG_IMAGE_KEY=ros2_humble.as2.estimator)
+# so it FROMs the as2 layer (which already has ROS 2 Humble + aerostack2 build
+# deps). Mirrors project_mpcc: compile OpenCV 4.10 +contrib +CUDA from source
+# (needed to build as2_gates_localization, which uses cv::cuda::remap /
+# cudawarping in its real-camera undistort path) and rebuild cv_bridge against
+# it. The fake-PnP node (project_gates_node.py) consumes only cv2.projectPoints
+# on CPU, but the C++ estimator must still LINK the CUDA OpenCV.
+#
+# The estimator/aerostack2 workspace (/root/a2rl) is NOT baked in — it is
+# bind-mounted at runtime and colcon-built there; this layer only provides the
+# system OpenCV-CUDA + cv_bridge + python deps + env wiring.
+#
+# Build cost: the OpenCV-CUDA compile dominates (~60-90 min first build; cached
+# after). Narrow OPENCV_CUDA_ARCH_BIN to your GPU to speed it up.
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+USER root
+ENV DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-c"]
+
+# ── OpenCV 4.10 +contrib +CUDA (self-contained: installs its own apt deps,
+#    builds python3 bindings into /usr/local, uninstalls pip opencv so the
+#    source cv2 is the one `import cv2` resolves) ──────────────────────────
+ARG OPENCV_VERSION="4.10.0"
+# Turing 7.5 / Ampere 8.0,8.6 / Ada 8.9 — narrow to your GPU to speed the build.
+ARG OPENCV_CUDA_ARCH_BIN="7.5;8.0;8.6;8.9"
+ENV OPENCV_VERSION=${OPENCV_VERSION}
+ENV OPENCV_CUDA_ARCH_BIN=${OPENCV_CUDA_ARCH_BIN}
+COPY scripts/build_opencv_cuda.sh /tmp/build_opencv_cuda.sh
+RUN chmod +x /tmp/build_opencv_cuda.sh && /tmp/build_opencv_cuda.sh && rm /tmp/build_opencv_cuda.sh
+
+# ── cv_bridge rebuilt from source against /usr/local OpenCV-CUDA, installed to
+#    /opt/cv_bridge_ws/install (sourced before the apt cv_bridge below) ──────
+COPY scripts/rebuild_cv_bridge.sh /tmp/rebuild_cv_bridge.sh
+RUN chmod +x /tmp/rebuild_cv_bridge.sh && /tmp/rebuild_cv_bridge.sh && rm /tmp/rebuild_cv_bridge.sh
+
+# ── Python + ROS deps the fake-PnP / estimator pipeline needs ─────────────
+#    cv2 comes from the source build above; here only the rest.
+RUN python3 -m pip install --no-cache-dir "numpy<2" scipy pymap3d pyyaml
+RUN apt-get update --allow-releaseinfo-change \
+    && apt-get install -y --no-install-recommends \
+       tmux tmuxinator \
+       ros-humble-tf-transformations \
+       ros-humble-backward-ros \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Runtime env: source the rebuilt cv_bridge, point AEROSTACK2_PATH at the
+#    bind-mounted /root/a2rl aerostack2, source its as2_cli + workspace install.
+#    All guarded by existence so the image still works before /root/a2rl is
+#    mounted/built. Adjust A2RL_ROOT if you mount the workspace elsewhere. ───
+ENV A2RL_ROOT=/root/a2rl/aerostack2_ws
+ENV AEROSTACK2_PATH=/root/a2rl/aerostack2_ws/src/aerostack2
+RUN cat >> /etc/bash.bashrc <<'EOF'
+
+# --- project_estimator: OpenCV-CUDA cv_bridge + a2rl aerostack2 env ---
+[ -f /opt/cv_bridge_ws/install/setup.bash ] && source /opt/cv_bridge_ws/install/setup.bash
+export AEROSTACK2_PATH=${AEROSTACK2_PATH:-/root/a2rl/aerostack2_ws/src/aerostack2}
+[ -f "$AEROSTACK2_PATH/as2_cli/setup_env.bash" ] && source "$AEROSTACK2_PATH/as2_cli/setup_env.bash"
+[ -f /root/a2rl/aerostack2_ws/install/setup.bash ] && source /root/a2rl/aerostack2_ws/install/setup.bash
+# --- end project_estimator env ---
+EOF

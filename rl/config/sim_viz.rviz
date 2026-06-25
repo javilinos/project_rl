@@ -1,0 +1,49 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Enabled: true
+      Name: Grid
+      Cell Size: 1
+      Plane Cell Count: 40
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Gates
+      Topic:
+        Value: /rl/track_gates
+        Depth: 5
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: Drone
+      Topic:
+        Value: /rl/drone
+        Depth: 5
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: Trail
+      Topic:
+        Value: /rl/trail
+        Depth: 5
+        Reliability Policy: Reliable
+  Global Options:
+    Fixed Frame: earth
+    Background Color: 48; 48; 48
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/FocusCamera
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 40
+      Focal Point:
+        X: 11
+        Y: 14
+        Z: 1.5
+      Pitch: 0.6
+      Yaw: 0.8

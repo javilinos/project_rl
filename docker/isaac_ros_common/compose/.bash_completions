@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# load_all_completions.sh
+# Aggressively source as many bash completion scripts as possible.
+
+# Must be bash + interactive-ish
+if [[ -z "${BASH_VERSION:-}" ]]; then
+  echo "Not running in bash. Start bash first." >&2
+  return 1 2>/dev/null || exit 1
+fi
+
+# Ensure programmable completion is enabled
+shopt -s progcomp 2>/dev/null || true
+
+# Helper: source file if readable, avoid duplicates
+__sourced_completions=()
+__already_sourced() {
+  local f="$1"
+  local x
+  for x in "${__sourced_completions[@]}"; do
+    [[ "$x" == "$f" ]] && return 0
+  done
+  return 1
+}
+__try_source() {
+  local f="$1"
+  [[ -r "$f" ]] || return 0
+  __already_sourced "$f" && return 0
+  # shellcheck disable=SC1090
+  source "$f" >/dev/null 2>&1 || true
+  __sourced_completions+=("$f")
+}
+
+# 1) Base bash-completion framework
+for base in \
+  /usr/share/bash-completion/bash_completion \
+  /etc/bash_completion \
+  /usr/local/share/bash-completion/bash_completion
+do
+  __try_source "$base"
+done
+
+# 2) Source completion "directories" (order matters a bit)
+# System-wide
+for d in \
+  /usr/share/bash-completion/completions \
+  /usr/local/share/bash-completion/completions \
+  /etc/bash_completion.d
+do
+  if [[ -d "$d" ]]; then
+    while IFS= read -r -d '' f; do
+      __try_source "$f"
+    done < <(find "$d" -maxdepth 1 -type f -print0 2>/dev/null)
+  fi
+done
+
+# 3) User completions (if any)
+for d in \
+  "$HOME/.local/share/bash-completion/completions" \
+  "$HOME/.bash_completion.d"
+do
+  if [[ -d "$d" ]]; then
+    while IFS= read -r -d '' f; do
+      __try_source "$f"
+    done < <(find "$d" -maxdepth 1 -type f -print0 2>/dev/null)
+  fi
+done
+
+# 4) Also source ~/.bash_completion if present
+__try_source "$HOME/.bash_completion"
+
+# Report
+echo "Sourced ${#__sourced_completions[@]} completion files."
+# Uncomment to list them:
+# printf '%s\n' "${__sourced_completions[@]}"

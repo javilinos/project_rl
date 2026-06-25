@@ -21,6 +21,7 @@ import numpy as np
 import rclpy
 import yaml
 from as2_python_api.drone_interface_teleop import DroneInterfaceTeleop
+from actuator_msgs.msg import Actuators
 from as2_msgs.msg import ControlMode, Thrust
 from as2_msgs.srv import SetControlMode, SetPlatformState
 from geometry_msgs.msg import Pose, PoseStamped, TwistStamped, Vector3
@@ -192,6 +193,16 @@ class DroneGoalEnv(gym.Env):
             PoseStamped, f'/{self.drone_namespace}/self_localization/pose',
             self._pose_quat_callback, qos_profile_sensor_data)
 
+        # Cache the latest BODY-FRAME angular velocity (measured body rates ω)
+        # off self_localization/twist — DroneInterface consumes the same topic
+        # but keeps only the linear part. ω is part of the rotational state and
+        # the body-rate reward penalty operates on it. None until the first
+        # message → falls back to zeros (see _read_omega).
+        self._latest_omega: tuple[float, float, float] | None = None
+        self._twist_omega_sub = self._svc_node.create_subscription(
+            TwistStamped, f'/{self.drone_namespace}/self_localization/twist',
+            self._twist_omega_callback, qos_profile_sensor_data)
+
         self._set_state_client = self._svc_node.create_client(
             SetPlatformState,
             f"/{self.drone_namespace}/set_platform_state",
@@ -228,16 +239,27 @@ class DroneGoalEnv(gym.Env):
         #             engaging ControlMode.ACRO on the platform).
         action_cfg = self.cfg.get('action', {})
         self._action_mode = str(action_cfg.get('mode', 'speed')).lower()
-        if self._action_mode not in ('speed', 'rates'):
+        if self._action_mode not in ('speed', 'rates', 'motor'):
             raise ValueError(
-                f"action.mode must be 'speed' or 'rates', got "
+                f"action.mode must be 'speed', 'rates' or 'motor', got "
                 f"{self._action_mode!r}.")
+        # rates and motor are both low-level modes: they engage ACRO on the
+        # platform (to satisfy the AS2 FSM / accept actuator commands) and both
+        # expose body rates ω in the observation.
+        self._motors_pub = None
+        self._latest_motor_speed: tuple[float, float, float, float] | None = None
         if self._action_mode == 'rates':
             rates_cfg = action_cfg.get('rates') or {}
             self._roll_rate_max = float(rates_cfg.get('roll_rate_max', 22.0))
             self._pitch_rate_max = float(rates_cfg.get('pitch_rate_max', 22.0))
             self._yaw_rate_max_rates = float(rates_cfg.get(
                 'yaw_rate_max', 22.0))
+            # tanh scale for the measured-body-rate (ω) obs channels: the
+            # largest commanded rate limit, so the operating range maps to
+            # ≈ ±0.76 with graceful saturation for overshoot.
+            self._w_obs_scale = max(
+                self._roll_rate_max, self._pitch_rate_max,
+                self._yaw_rate_max_rates, 1e-3)
             self._thrust_min = float(rates_cfg.get('thrust_min', 0.0))
             self._thrust_max = float(rates_cfg.get('thrust_max', 30.0))
             # Hover thrust = vehicle mass × g; sets the zero-action thrust
@@ -269,6 +291,40 @@ class DroneGoalEnv(gym.Env):
                     f'/{self.drone_namespace}/set_platform_control_mode '
                     'unavailable after 10s. Rates mode needs the platform '
                     'to expose this service.')
+        elif self._action_mode == 'motor':
+            # Direct per-motor control (winning A2RL formulation): the policy
+            # commands the 4 motor angular velocities — no inner attitude/rate
+            # controller (the policy IS the controller). The patched platform
+            # routes actuator_command/motors → simulator MOTOR_W and publishes
+            # the actual (lagged) motor speeds on motor_speed for the obs.
+            motor_cfg = action_cfg.get('motor') or {}
+            self._motor_max_speed = float(motor_cfg.get('max_speed', 1139.34272))
+            self._motor_min_speed = float(motor_cfg.get('min_speed', 0.0))
+            self._motor_limit = float(motor_cfg.get('motor_limit', 1.0))
+            self._motor_u_lim = 2.0 * self._motor_limit - 1.0   # action upper bound
+            self._motor_hover_speed = float(motor_cfg.get('hover_speed', 510.0))
+            # ω-obs scale (motor mode has no rate limit) and motor-rpm-obs scale.
+            self._w_obs_scale = float(motor_cfg.get('w_obs_scale', 20.0))
+            self._motor_obs_scale = max(self._motor_max_speed, 1e-6)
+            self._thrust_pub = None
+            self._twist_pub = None
+            self._motors_pub = self._svc_node.create_publisher(
+                Actuators, f'/{self.drone_namespace}/actuator_command/motors', 10)
+            # Cache the actual motor speeds for the observation (mirrors the
+            # pose-quaternion / twist-ω subs). None until the first message.
+            self._motor_speed_sub = self._svc_node.create_subscription(
+                Actuators, f'/{self.drone_namespace}/motor_speed',
+                self._motor_speed_callback, qos_profile_sensor_data)
+            # Engage ACRO so the AS2 FSM accepts actuator commands; the motors
+            # topic then overrides the sim into MOTOR_W (same FSM trick as rates).
+            self._set_mode_client = self._svc_node.create_client(
+                SetControlMode,
+                f'/{self.drone_namespace}/set_platform_control_mode')
+            if not self._set_mode_client.wait_for_service(timeout_sec=10.0):
+                raise RuntimeError(
+                    f'/{self.drone_namespace}/set_platform_control_mode '
+                    'unavailable after 10s. Motor mode needs the patched '
+                    'platform exposing this service + actuator_command/motors.')
         else:
             self._thrust_pub = None
             self._twist_pub = None
@@ -280,18 +336,23 @@ class DroneGoalEnv(gym.Env):
         # singularity-free:
         #   speed mode (10-D): core + relative yaw / π (1). The motion controller
         #     handles attitude, so only relative heading matters.
-        #   rates mode (15-D): core + a 6D continuous rotation (6). The 6D
-        #     (first two columns of the gate→body rotation, Zhou et al. 2019)
-        #     encodes the drone's attitude relative to the GATE FRAME — a stable
-        #     per-episode reference, so it changes only when the drone rotates,
-        #     never with its position (a line-of-sight reference spins as the
-        #     drone moves and is singular AT the gate). Being gate-relative it
-        #     also carries the gate facing / which-side. Singularity-free
-        #     (quaternion-sourced): no ±180° yaw wrap, no ±90° pitch gimbal,
-        #     roll unique through inversion. The camera uvec replaces the old
-        #     atan2 azimuth/elevation (which jumped when the gate passed behind).
-        #     See `_rotation_6d` / `_camera_pointing`.
-        self._obs_dim = 15 if self._action_mode == 'rates' else 10
+        #   rates mode (22-D): core + 6D rotation (6) + measured body rates ω (3)
+        #     + previous action (4). Follows the Environment-as-Policy (UZH RPG,
+        #     ICRA 2025) in-rates state [R̃, v, ω, a_prev, gate], with the gate
+        #     encoded NOT as corners: the 6D (first two columns of the gate→body
+        #     rotation, Zhou et al. 2019) is the drone's attitude relative to the
+        #     stable GATE FRAME, so it carries gate orientation / which-side, and
+        #     the gate position is the relative-position core. Singularity-free
+        #     (quaternion-sourced): no ±180° yaw wrap, no ±90° pitch gimbal, roll
+        #     unique through inversion. ω is the rotational state; a_prev pairs
+        #     with the action-smoothness reward. The camera uvec replaces the old
+        #     atan2 azimuth/elevation. See `_rotation_6d` / `_camera_pointing`.
+        #   motor mode (26-D): the rates-mode 22-D + 4 actual motor speeds
+        #     (rad/s, normalized). Direct per-motor control (winning A2RL setup):
+        #     no inner controller, and the observable motor speeds make the
+        #     actuator-lag (tau) POMDP Markov.
+        self._obs_dim = {'speed': 10, 'rates': 22, 'motor': 26}[
+            self._action_mode]
         # Camera mount tilt (forward/UP from body +x; FPV uptilt), radians.
         # Drives the full-3D camera pointing: the camera-frame azimuth/
         # elevation obs channels and the roll-invariant off-axis pointing
@@ -319,7 +380,11 @@ class DroneGoalEnv(gym.Env):
         # for the relative-yaw observation, continuous alignment penalty, and
         # the terminal alignment bonus.
         self._target_yaw = float(self.cfg['target'].get('yaw', 0.0))
+        # Action history for the previous-action obs channel and the
+        # action-smoothness reward: _last_action = u_t (the action applied this
+        # step), _action_prev = u_{t-1}. _apply_action rolls them forward.
         self._last_action = np.zeros(4, dtype=np.float32)
+        self._action_prev = np.zeros(4, dtype=np.float32)
         self._closed = False
         # Spawn-to-target distance recorded at every reset(); drives the
         # terminal time-budget for the success bonus. Initialized to 0
@@ -443,11 +508,13 @@ class DroneGoalEnv(gym.Env):
                 'Platform refused ACRO control mode. Check that ACRO is '
                 'enabled in the platform\'s control_modes.yaml.')
 
-        # Prime the platform with a hover-thrust, zero-rates command so it
-        # has a reference to track from t=0. self._thrust_hover comes from
-        # action.rates.thrust_hover in the config (validated at __init__
-        # to lie within [thrust_min, thrust_max]).
-        self._send_rates_command(0.0, 0.0, 0.0, self._thrust_hover)
+        # Prime the platform with a hover command so it has a reference to
+        # track from t=0. Rates: hover thrust + zero rates. Motor: hover motor
+        # speed on all 4 (this also flips the sim into MOTOR_W).
+        if self._action_mode == 'motor':
+            self._send_motor_command([self._motor_hover_speed] * 4)
+        else:
+            self._send_rates_command(0.0, 0.0, 0.0, self._thrust_hover)
 
     def close(self) -> None:
         if self._closed:
@@ -521,6 +588,8 @@ class DroneGoalEnv(gym.Env):
         #           and any subsequent _apply_action.
         if self._action_mode == 'speed':
             self._send_speed_command(0.0, 0.0, 0.0, 0.0)
+        elif self._action_mode == 'motor':
+            self._send_motor_command([self._motor_hover_speed] * 4)
         else:
             self._send_rates_command(0.0, 0.0, 0.0, self._thrust_hover)
 
@@ -532,6 +601,10 @@ class DroneGoalEnv(gym.Env):
         time.sleep(2.0 * self._dt)
 
         self._step_idx = 0
+        # Clear action history so the first obs reports "no prior command" and
+        # the first action-smoothness penalty is measured against zeros.
+        self._last_action = np.zeros(4, dtype=np.float32)
+        self._action_prev = np.zeros(4, dtype=np.float32)
         # Disarm success until the drone is seen outside the gate plane.
         # _check_done arms it once abs(gate_depth) >= depth_tol, so a stale
         # first observation that still reads the drone at the gate cannot
@@ -574,6 +647,10 @@ class DroneGoalEnv(gym.Env):
             until PPO learns to cancel the structural climb bias.
         """
         a = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+        # Roll the action history forward: previous u_t becomes u_{t-1}, the
+        # new command becomes u_t. Used by the previous-action obs channel and
+        # the action-smoothness reward ‖u_t − u_{t-1}‖.
+        self._action_prev = self._last_action
         self._last_action = a
         # Resume physics (no-op if not paused) before pushing the new command.
         self._set_physics(False)
@@ -583,7 +660,7 @@ class DroneGoalEnv(gym.Env):
             vx, vy, vz = (a[:3] * v_max).tolist()
             vyaw = float(a[3] * yaw_rate_max)
             self._send_speed_command(vx, vy, vz, vyaw)
-        else:  # 'rates'
+        elif self._action_mode == 'rates':
             roll_rate = float(a[0]) * self._roll_rate_max
             pitch_rate = float(a[1]) * self._pitch_rate_max
             yaw_rate = float(a[2]) * self._yaw_rate_max_rates
@@ -595,6 +672,12 @@ class DroneGoalEnv(gym.Env):
                 thrust = self._thrust_hover + a3 * (
                     self._thrust_hover - self._thrust_min)
             self._send_rates_command(roll_rate, pitch_rate, yaw_rate, thrust)
+        else:  # 'motor' — linear map (winner's): a∈[-1,u_lim] → (a+1)/2·max_speed
+            cmd = np.clip(a, -1.0, self._motor_u_lim)
+            motor_speeds = (self._motor_min_speed
+                            + 0.5 * (cmd + 1.0)
+                            * (self._motor_max_speed - self._motor_min_speed))
+            self._send_motor_command(motor_speeds)
 
     def _observe_step(self):
         """Compute observation, reward, and termination from a single state
@@ -694,6 +777,24 @@ class DroneGoalEnv(gym.Env):
         reward += progress_reward
         self._prev_dist_to_target = curr_dist
 
+        # Environment-as-Policy regularizers (paired with the a_prev / ω obs):
+        #   r_act = − k_act · ‖u_t − u_{t-1}‖   action smoothness (damps the
+        #           "noisy/oscillating command" failure mode and stops the
+        #           previous-action channel from becoming a copy-the-last-action
+        #           attractor — that pairing is the point);
+        #   r_br  = − k_br  · ‖ω‖               body-rate penalty (discourages
+        #           needless spinning / aggressive tumbling). Both use L2 norms.
+        rw = self.cfg['reward']
+        k_act = float(rw.get('k_act', 0.0))
+        k_br = float(rw.get('k_br', 0.0))
+        action_smooth = float(np.linalg.norm(
+            np.asarray(self._last_action, dtype=np.float64)
+            - np.asarray(self._action_prev, dtype=np.float64)))
+        body_rate_mag = float(np.linalg.norm(self._read_omega()))
+        smooth_reward = -k_act * action_smooth
+        body_rate_reward = -k_br * body_rate_mag
+        reward += smooth_reward + body_rate_reward
+
         terminated, truncated, info = self._check_done(
             pos, gate_depth, gate_lateral, gate_vertical,
             gate_normal_dot_vel)
@@ -701,6 +802,8 @@ class DroneGoalEnv(gym.Env):
             'dist_xy': dist_xy,
             'dist_3d': curr_dist,
             'progress_reward': progress_reward,
+            'smooth_reward': smooth_reward,
+            'body_rate_reward': body_rate_reward,
             'bearing': bearing,
             'yaw_err': yaw_err,
             'vel_body_x': vel_body_x,
@@ -1065,6 +1168,16 @@ class DroneGoalEnv(gym.Env):
         twist_msg.twist.angular.z = float(yaw_rate)
         self._twist_pub.publish(twist_msg)
 
+    def _send_motor_command(self, motor_speeds) -> None:
+        """Publish the 4 motor angular velocities (rad/s) to the platform's
+        actuator_command/motors topic. The patched platform routes these
+        straight into the simulator's MOTOR_W mode — no inner controller."""
+        msg = Actuators()
+        msg.header.stamp = self._svc_node.get_clock().now().to_msg()
+        msg.header.frame_id = f'{self.drone_namespace}/base_link'
+        msg.velocity = [float(w) for w in motor_speeds]
+        self._motors_pub.publish(msg)
+
     def _publish_gate_marker(self) -> None:
         """Publish a MESH_RESOURCE Marker for the cvar_gate at the configured
         target pose. Periodic so RViz picks it up after reconnects."""
@@ -1155,6 +1268,35 @@ class DroneGoalEnv(gym.Env):
         topic DroneInterface uses, but keeping the quaternion)."""
         q = msg.pose.orientation
         self._latest_quat = (q.w, q.x, q.y, q.z)
+
+    def _twist_omega_callback(self, msg: TwistStamped) -> None:
+        """Cache the body-frame angular velocity (measured body rates ω) from
+        self_localization/twist (DroneInterface keeps only the linear part)."""
+        w = msg.twist.angular
+        self._latest_omega = (w.x, w.y, w.z)
+
+    def _read_omega(self) -> np.ndarray:
+        """Measured body rates ω (rad/s, body frame). Zeros until the first
+        twist message arrives."""
+        w = self._latest_omega
+        if w is None:
+            return np.zeros(3, dtype=np.float64)
+        return np.array(w, dtype=np.float64)
+
+    def _motor_speed_callback(self, msg: Actuators) -> None:
+        """Cache the actual motor angular velocities from the platform's
+        motor_speed topic (motor mode obs). Zeros-fallback until first message."""
+        v = msg.velocity
+        if len(v) >= 4:
+            self._latest_motor_speed = (v[0], v[1], v[2], v[3])
+
+    def _read_motor_speed(self) -> np.ndarray:
+        """Actual motor angular velocities (rad/s). Zeros until the first
+        motor_speed message arrives."""
+        w = self._latest_motor_speed
+        if w is None:
+            return np.zeros(4, dtype=np.float64)
+        return np.array(w, dtype=np.float64)
 
     def _read_rotation(self) -> np.ndarray:
         """Body→world rotation R_wb. Prefers the cached attitude quaternion
@@ -1271,18 +1413,36 @@ class DroneGoalEnv(gym.Env):
             float(los_cam[1]),
             float(los_cam[2]),
         ]
-        if self._action_mode == 'rates':
-            # 6D continuous rotation: the drone's attitude relative to the GATE
-            # FRAME (first two columns of the gate→body rotation). The reference
-            # is the gate's stable per-episode orientation, so this changes only
-            # when the drone rotates — never with its position (a line-of-sight
-            # reference spins as the drone moves and is singular AT the gate).
+        if self._action_mode in ('rates', 'motor'):
+            # Low-level modes share this block. 6D continuous rotation: the
+            # drone's attitude relative to the GATE FRAME (first two columns of
+            # the gate→body rotation). Stable per-episode reference, so it
+            # changes only when the drone rotates — never with its position.
             # Singularity-free (quaternion-sourced): no yaw wrap, no inversion
             # ambiguity, no pitch gimbal. Being gate-relative, it ALSO carries
-            # the gate facing / which-side, so no separate facing channel is
-            # needed. See `_rotation_6d`.
+            # the gate facing / which-side. See `_rotation_6d`.
             obs_list.extend(_rotation_6d(r_wb, self._target_yaw).tolist())
-        else:
+            # Measured body rates ω (rad/s, body frame), tanh-scaled. Current
+            # rotational state — the policy must see it to regulate its rates
+            # (and it is what the body-rate reward penalty acts on). Distinct
+            # from the COMMAND (the previous action below).
+            omega = self._read_omega()
+            obs_list.extend([
+                math.tanh(omega[0] / self._w_obs_scale),
+                math.tanh(omega[1] / self._w_obs_scale),
+                math.tanh(omega[2] / self._w_obs_scale),
+            ])
+            # Previous action u_{t-1} (rate/thrust or motor command), in [-1, 1].
+            # Paired with the action-smoothness reward ‖u_t − u_{t-1}‖.
+            obs_list.extend(float(a) for a in self._last_action)
+        if self._action_mode == 'motor':
+            # Actual (lagged) motor angular velocities, normalized to [-1, 1].
+            # Makes the actuator's hidden spool-up state OBSERVABLE → the
+            # motor-lag (tau) POMDP becomes Markov (the winner's key fix).
+            mw = self._read_motor_speed()
+            obs_list.extend(
+                float(2.0 * w / self._motor_obs_scale - 1.0) for w in mw)
+        elif self._action_mode == 'speed':
             # Speed mode doesn't control attitude; only relative heading matters.
             obs_list.append(yaw_rel / math.pi)
         obs = np.array(obs_list, dtype=np.float32)
@@ -1309,6 +1469,10 @@ class DroneGoalEnv(gym.Env):
             cam_off_axis=cam_off_axis,
             cam_off_axis_reward=cam_off_axis_reward,
             los_cam=los_cam,
+            omega=self._read_omega(),
+            last_action=np.asarray(self._last_action, dtype=np.float64),
+            action_prev=np.asarray(self._action_prev, dtype=np.float64),
+            motor_speed=self._read_motor_speed(),
         )
 
     def _get_obs(self) -> np.ndarray:
@@ -1319,11 +1483,14 @@ class DroneGoalEnv(gym.Env):
           continuous on the sphere — no atan2 wrap when the gate goes behind).
         Then:
           speed (10-D): + [9] relative yaw (drone − target) / π.
-          rates (15-D): + [9..14] 6D continuous rotation — the first two columns
-            of the gate→body rotation matrix (gate's normal & left axes in the
-            body frame; attitude relative to the stable gate frame, also carries
-            gate facing / which-side, quaternion-sourced and discontinuity-free).
-            See `_rotation_6d` / `_camera_pointing`.
+          rates (22-D): + [9..14] 6D continuous rotation — first two columns of
+            the gate→body rotation (attitude relative to the stable gate frame,
+            carries gate facing / which-side, quaternion-sourced, discontinuity-
+            free); + [15..17] measured body rates ω (gyro, body frame, tanh-
+            scaled); + [18..21] previous action (command u_{t-1}, in [-1, 1]).
+          motor (26-D): the rates-mode 22-D + [22..25] actual motor speeds
+            (rad/s, normalized to [-1, 1]) — direct per-motor control with the
+            actuator state observable. See `_rotation_6d` / `_camera_pointing`.
         """
         return self._compute_state().obs
 

@@ -1,0 +1,29 @@
+services:
+  ros2:
+    image: isaac_ros_dev-x86_64
+    container_name: aerostack2_container
+    init: true
+    shm_size: "8g"
+    environment:
+      DISPLAY: $DISPLAY
+      XAUTHORITY: $XAUTHORITY
+      SSH_AUTH_SOCK: /ssh-agent
+    runtime: nvidia
+    privileged: true
+    restart: always
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ~/.Xauthority:/root/.Xauthority
+      - ~/.gitconfig:/root/.gitconfig_local
+      - ~/a2rl:/root/a2rl
+      - ~/aerostack2_ws_docker:/root/aerostack2_ws
+      - ~/setup_tools:/root/setup_tools
+      - ~/project_kalibration:/root/project_kalibration
+      - ~/msdk:/root/msdk
+      - ~/projects_docker:/root/as2_projects
+      - ~/external_libs_docker:/root/external_libs
+      - ~/isaac_ros_common/compose/.bash_profile:/root/.bashrc
+      - ~/isaac_ros_common/compose/.bash_completions:/root/.bash_completions
+      - ${SSH_AUTH_SOCK}:/ssh-agent
+    network_mode: "host"
+    command: tail -f /dev/null

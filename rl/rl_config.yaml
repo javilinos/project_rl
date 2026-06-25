@@ -54,10 +54,18 @@ action:
   #             platform's actuator_command/{thrust,twist} topics. The PID
   #             controller in this stack doesn't accept ACRO as input, so
   #             the direct-publish route is the only one that works without
-  #             rebuilding the controller. NOTE: action semantics are
-  #             completely different — a speed-mode checkpoint cannot be
-  #             loaded in rates mode and vice versa.
-  mode: rates
+  #             rebuilding the controller.
+  #   "motor" → action = [m1, m2, m3, m4] (the 4 motor commands). Publishes to
+  #             actuator_command/motors; the patched platform routes them into
+  #             the simulator's MOTOR_W mode — motor speeds go STRAIGHT to the
+  #             dynamics, NO inner attitude/rate controller (the policy is the
+  #             controller). This is the winning A2RL-2025 formulation: it
+  #             removes the inner-loop instability that flips the drone in
+  #             rates mode, and the actual motor speeds are observed (obs 26-D)
+  #             so the motor-lag (tau) POMDP becomes Markov. Needs the rebuilt
+  #             as2_platform_multirotor_simulator.
+  # NOTE: action semantics differ per mode — a checkpoint is mode-specific.
+  mode: motor
   v_max: 20.0           # m/s. In speed mode: per-axis action scale.
                         # In rates mode: still used for velocity-obs tanh
                         # scale and reward terms (k_speed, k_vertical,
@@ -86,6 +94,20 @@ action:
                           # uav_config.yaml. If you change the mass there,
                           # re-tune this so action[3]=0 actually hovers.
     thrust_max:   40.0    # N
+
+  motor:                  # used only when mode == "motor"
+    # Linear map (winner's): a ∈ [-1, u_lim] → ω = (a+1)/2 · max_speed, with
+    # u_lim = 2*motor_limit - 1. a=0 → 50% throttle (slight climb); the policy
+    # learns the hover point itself (helped by the body-rate/smoothness terms).
+    max_speed:   1139.34272  # rad/s — MUST match uav_config motors_params.max_speed.
+    min_speed:   0.0         # rad/s
+    motor_limit: 1.0         # upper action bound: u_lim = 2*motor_limit - 1.
+    # Hover prime (reset/takeoff reference). ≈ sqrt(vehicle_mass·g / (4·k_f));
+    # for mass 1.013, k_f 9.5548e-6 → ~510 rad/s. Re-derive if the model changes.
+    hover_speed: 510.0       # rad/s
+    # tanh scale for the body-rate ω obs in motor mode (no rate limit to reuse);
+    # ~the physical steady-rate envelope so racing rates don't saturate early.
+    w_obs_scale: 20.0        # rad/s
 
 
 # Episode terminates if drone leaves this box.
@@ -184,8 +206,8 @@ reward:
   # scale unchanged. Terminal-event rewards (success/oob/crash) are NOT
   # rescaled — they fire once per episode regardless of step rate.
   k_pos: 0.005           # distance penalty (xy)
-  k_height: 0.01        # height penalty (|z|)
-  k_bearing: 0.03        # "look at the gate" pointing penalty:
+  k_height: 0.03        # height penalty (|z|)
+  k_bearing: 0.01        # "look at the gate" pointing penalty:
                          # − k_bearing · pointing_norm,
                          # where pointing_norm = (camera off-axis angle)/π —
                          # the roll-INVARIANT 3D angle between the PnP camera
@@ -205,6 +227,17 @@ reward:
                          # "align then accelerate" strategy. We now want
                          # the policy to pick its own approach style.
   k_vertical: 0.0      # penalty on vertical speed: − k_vertical · |vz_body|/v_max
+  # Environment-as-Policy (UZH RPG, ICRA 2025) regularizers, paired with the
+  # rates-mode a_prev / ω observation channels. These are what make those
+  # channels useful (and harmless): without the smoothness term the previous-
+  # action channel degenerates into a "copy the last action" attractor.
+  k_act: 0.00          # action smoothness: − k_act · ‖u_t − u_{t-1}‖ (L2 of the
+                       # 4-D action delta, action in [-1,1]). Damps oscillating/
+                       # noisy commands. Set 0 to disable.
+  k_br:  0.00         # body-rate penalty: − k_br · ‖ω‖ (L2 of the measured
+                       # body rates, rad/s). Discourages needless spinning /
+                       # tumbling; keep small so real maneuvers aren't blocked.
+                       # Set 0 to disable.
   # Dense progress reward: + k_progress · (prev_dist − curr_dist) meters
   # (3D) each step. Gives the policy a strong dense gradient toward the gate
   # so it doesn't rely solely on the sparse terminal bonus to find the gate.

@@ -88,8 +88,8 @@ def main() -> None:
             env=vec,
             verbose=1,
             tensorboard_log=str(logs_dir),
-            n_steps=1024,
-            batch_size=256,
+            n_steps=2000,
+            batch_size=5000,
             n_epochs=10,
             gae_lambda=0.95,
             normalize_advantage=True,
@@ -115,17 +115,17 @@ def main() -> None:
             #     ≈ 0.5–0.7 rad/s on rates (survivable for early training).
             # If you flip action.mode back to "speed" OR change control_hz,
             # revisit the matching set together — they're tied.
-            gamma=0.9995,
+            gamma=0.999,
             vf_coef=0.5,
-            learning_rate=1e-4,
-            ent_coef=0.001,
-            use_sde=True,
-            sde_sample_freq=24,
+            learning_rate=3e-4,
+            ent_coef=0.0,
+            # use_sde=True,
+            # sde_sample_freq=24,
             policy_kwargs=dict(
-                log_std_init=-2.5,
-                ortho_init=True,
-                activation_fn=torch.nn.ReLU,
-                net_arch=dict(pi=[256, 256, 128], vf=[256, 256, 128])
+                log_std_init=0.0,
+                # ortho_init=True,
+                activation_fn=torch.nn.Tanh,
+                net_arch=dict(pi=[64, 64, 64], vf=[256, 256, 256])
             )
         )
 

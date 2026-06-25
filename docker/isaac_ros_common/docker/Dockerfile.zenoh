@@ -1,0 +1,27 @@
+# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto.  Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+RUN apt-get update && apt-get install -y ros-humble-rmw-cyclonedds-cpp curl
+RUN apt-get install llvm-dev libclang-dev -y
+
+WORKDIR /root
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN git clone https://github.com/eclipse-zenoh/zenoh-plugin-ros2dds.git
+WORKDIR /root/zenoh-plugin-ros2dds
+RUN cargo build --release
+ENV PATH="/root/zenoh-plugin-ros2dds/target/release:${PATH}"
+
+RUN echo 'export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp' >> /root/.bashrc
+RUN echo 'export ROS_LOCALHOST_ONLY=1' >> /root/.bashrc
+
+RUN apt-get install -y iproute2 net-tools

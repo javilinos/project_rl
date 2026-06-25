@@ -4,78 +4,49 @@
       dynamics:
         model:
           gravity: [0.0, 0.0, -9.81] # m/s^2
-          # ---- Faithful to the Gazebo model config_gz/drone_cvar_racing.sdf ----
-          # Total flying mass = base_link 0.988 + imu 0.005 + 4 x rotor 0.005.
-          vehicle_mass: 1.013 # kg
-          # Composite full-body inertia about the CoM (~= body origin), built
-          # from the SDF as: base_link inertia + 4 rotor point-masses (parallel
-          # axis, m*y^2 / m*x^2 / m*(x^2+y^2)) + rotor own inertia + imu own
-          # inertia (imu sits at the origin). Gazebo base_link alone is
-          # [0.0032384, 0.0040254, 0.00459895]; rotors+imu add
-          # ~[2.89e-4, 5.27e-4, 8.08e-4].
-          #
-          #   Old uav_config.yaml used Ixx = 0.0016 — roughly HALF the true
-          #   value (and below the base-link-only Ixx, which is physically
-          #   impossible), making roll ~2x too twitchy. Iyy/Izz were close.
-          vehicle_inertia: [3.5277e-3, 4.5529e-3, 5.4071e-3] # kg*m^2 (Ixx, Iyy, Izz)
-          # Gazebo models aerodynamics PER-ROTOR (rotorDragCoefficient
-          # 8.06428e-5, rollingMomentCoefficient 1e-6), which a single lumped
-          # translational coefficient cannot reproduce 1:1. Left at 0 here —
-          # this is the one parameter that does NOT port cleanly; raise it if
-          # high-speed translational damping is needed. Angular aero damping is
-          # kept (below) because the model needs it for a finite rate ceiling.
-          vehicle_drag_coefficient: 0.05 # N/(m/s)^2
+          vehicle_mass: 0.966 # kg
+          # Inertia tuned so k_f*arm/I matches their MonoRace mixer k_p/k_q
+          # (roll ~4.36e-5, pitch ~2.28e-5): their drone is pitch-stiff
+          # (pitch authority ~= half roll). Was [3.5277e-3, 4.5529e-3, ...],
+          # nearly roll/pitch-symmetric, which made the policy over-pitch and
+          # sag. Ixx = k_f*y_dist/k_p_avg, Iyy = k_f*x_dist/k_q_avg.
+          vehicle_inertia: [4.164e-3, 9.010e-3, 5.4071e-3] # kg*m^2 (Ixx, Iyy, Izz)
+          vehicle_drag_coefficient: 0.0 # disabled; replaced by anisotropic body_quadratic_drag below
+          rotor_drag_coefficient: 5.37e-5 # N/((m/s)·(rad/s)) = their k_x (rotor-coupled linear drag)
+          # their k_x2 (fwd), k_y2 (lat); z restored for vertical damping (the
+          # known-good 5-gate value). Streamlined forward / draggy sideways.
+          body_quadratic_drag: [0.0041, 0.0151, 0.0093] # N/(m/s)^2 per body axis
+          # MonoRace thrust aero-droop. DISABLED for now (radius 0): at full
+          # nominal the k_hor*mu term adds +45-80% thrust at race speed, which
+          # balloons our (not-perfectly-matched) plant -> parabola+slam. Nominal
+          # values kept here for reference; re-enable gently (see notes).
+          thrust_k_angle: 3.12514 # their k_angle
+          thrust_k_hor: 7.225 # their k_hor
+          thrust_aero_radius: 0.0 # 0 disables droop; nominal = 0.0485775 (0.12954*0.75/2)
           vehicle_aero_moment_coefficient: [0.003, 0.003, 0.003] # Nm/(rad/s)^2
           force_process_noise_auto_correlation: 0.0 # (N/(rad/s)^2)^2
           moment_process_noise_auto_correlation: 0.0 # (Nm/(rad/s)^2)^2
           motors_params:
-            # Motor coefficients ported from the Gazebo MulticopterMotorModel:
-            #   motorConstant  9.554800624260215e-06  -> thrust_coefficient
-            #   momentConstant 0.01418425 (= km/kf, m)  -> torque_coefficient =
-            #       momentConstant * motorConstant = 1.35527681e-7
-            #   maxRotVelocity 1139.34272              -> max_speed
-            thrust_coefficient: 9.554800624260215e-06 # N/(rad/s)^2
-            torque_coefficient: 1.35527681e-7 # Nm/(rad/s)^2
-            min_speed: 0.0 # rad/s
-            max_speed: 1139.34272 # rad/s
-            # Gazebo: timeConstantUp 0.1504 s / timeConstantDown 0.111905 s. The
-            # multirotor model uses a single first-order time constant, so we
-            # take ~the mean here. (Old uav_config used 0.01 s — ~13x too fast,
-            # a major source of the over-agile/twitchy roll response.)
-            time_constant: 0.131 # s
-            # Rotor spin inertia about its own axis = Gazebo rotor link Izz.
-            rotational_inertia: 4.26041e-5 # kg*m^2
-            # Symmetric fallback (used ONLY if motors_x/y/direction are absent):
-            # mean arm lengths of the four asymmetric motors below.
+            thrust_coefficient: 1.55e-06 # N/(rad/s)^2 = their k_w (was 1.4973e-6, ~3% low)
+            torque_coefficient: 2.1238e-8 # Nm/(rad/s)^2
+            min_speed: 341.75 # rad/s
+            max_speed: 3100.0 # rad/s
+            time_constant: 0.03 # s = their tau (was 0.025)
+            rotational_inertia: 1.75e-6 # kg*m^2
             x_dist: 0.132248 # m  = (0.143513952 + 0.120981735) / 2
             y_dist: 0.117003 # m  = (0.104268989 + 0.129737027) / 2
-            # ---- ASYMMETRIC per-motor layout (overrides x_dist/y_dist) ----
-            # Requires the per-motor patch in as2_platform_multirotor_simulator.
-            # Index order = rotor_0..rotor_3, matching the SDF poses and spin
-            # directions exactly (direction: +1 = CW, -1 = CCW):
-            #   rotor_0 ccw  (+0.143513952, -0.104268989)
-            #   rotor_1 ccw  (-0.120981735, +0.129737027)
-            #   rotor_2 cw   (+0.143513952, +0.104268989)
-            #   rotor_3 cw   (-0.120981735, -0.129737027)
-            # The real frame is longer in +x at the front and wider in y at the
-            # rear, so roll/pitch torque arms differ per motor — something the
-            # symmetric quad-X helper cannot represent.
-            motors_x:         [ 0.143513952, -0.120981735,  0.143513952, -0.120981735]
-            motors_y:         [-0.104268989,  0.129737027,  0.104268989, -0.129737027]
-            motors_direction: [-1.0, -1.0,  1.0,  1.0]
+            motors_x: [0.143513952, -0.120981735, 0.143513952, -0.120981735]
+            motors_y: [-0.104268989, 0.129737027, 0.104268989, -0.129737027]
+            motors_direction: [-1.0, -1.0, 1.0, 1.0]
       controller:
         indi:
-          kp: [9.0, 9.0, 9.0]
-          ki: [3.0, 3.0, 3.0]
-          kd: [0.3, 0.3, 0.3]
-          alpha: [0.6, 0.6, 0.6]
+          kp: [14.875, 14.875, 16.25]
+          ki: [1.95, 1.95, 2.25]
+          kd: [2.25, 2.25, 0.0]
+          alpha: [0.37775, 0.37775, 0.65844]
           antiwindup_cte: [1.0, 1.0, 1.0]
           angular_acceleration_limit: [0.0, 0.0, 0.0] # rad/s^2
         acro:
-          # NOTE: kp_rot is the ACRO rate-loop gain; it was tuned for the OLD
-          # inertia. With the corrected (higher, true) Ixx the same gain gives a
-          # lower roll closed-loop bandwidth (tamer) — re-tune if rate tracking
-          # rings or lags.
           kp_rot: [20.0, 20.0, 8.0]
         trajectory:
           kp: [10.0, 10.0, 10.0]

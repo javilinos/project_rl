@@ -93,6 +93,10 @@ def _check_observations(env: DroneGoalEnv, target_pos: np.ndarray) -> tuple[int,
     obs[9..14]: rates mode only — 6D continuous rotation (first two columns of
                the gate→body rotation matrix; attitude relative to the stable
                gate frame, also encodes gate facing / which-side).
+    obs[15..17]: rates/motor mode — measured body rates ω (gyro, body frame),
+               tanh-scaled.
+    obs[18..21]: rates/motor mode — previous action (command u_{t-1}).
+    obs[22..25]: motor mode only — actual motor speeds (rad/s, normalized).
     """
     max_dist_xy = env._max_dist_xy
     pos_max_z = env._pos_max_z

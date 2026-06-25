@@ -1,0 +1,39 @@
+# Copyright (c) 2021-2022, NVIDIA CORPORATION.  All rights reserved.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto.  Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+RUN python3 -m pip install -U ultralytics
+RUN python3 -m pip install -U hub_sdk
+RUN python3 -m pip install -U natsort
+RUN python3 -m pip install -U neptune
+RUN python3 -m pip install -U tifffile
+RUN python3 -m pip install -U tqdm
+RUN python3 -m pip install -U shapely
+RUN python3 -m pip install -U opencv-contrib-python
+RUN python3 -m pip install -U azure-storage-blob
+
+RUN echo "export PYTHONPATH=\$PYTHONPATH:/root/ultralytics/" >> /root/.bashrc
+RUN echo "export PYTHONPATH=\$PYTHONPATH:/root/format_unifier/" >> /root/.bashrc
+
+RUN apt-get install -y wget
+RUN wget https://drive.upm.es/s/EUBO5W6IV2Aneu9/download -O /root/best_5_channels_nano.onnx
+RUN wget https://drive.upm.es/s/mbvKx6QtCVP9kM4/download -O /root/best_cam0_FLIR_nano.onnx
+RUN wget https://drive.upm.es/s/xlzfDJ2w5spLs3E/download -O /root/best_cam0_medium.onnx
+RUN wget https://drive.upm.es/s/zt7ON0HFyM7Uc2C/download -O /root/best_cam0_nano.onnx
+
+RUN apt install -y bridge-utils
+RUN apt install -y net-tools
+RUN apt install -y libaio-dev
+
+RUN apt install -y tmux
+RUN apt install -y tmuxinator
+RUN rm /etc/apt/sources.list.d/*kitware*
+RUN echo "deb [trusted=yes] https://download.eclipse.org/zenoh/debian-repo/ /" | tee -a /etc/apt/sources.list > /dev/null
+RUN apt update && apt install zenoh-bridge-ros2dds -y 

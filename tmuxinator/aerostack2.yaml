@@ -25,7 +25,7 @@ windows:
         - ros2 launch as2_platform_multirotor_simulator as2_platform_multirotor_simulator.launch.py
             namespace:=<%= drone_namespace %>
             config_file:=config/config.yaml
-            uav_config:=config/uav_config.yaml
+            uav_config:=config/uav_config_cvar_racing.yaml
             world_config:=<%= simulation_config_file %>
             use_sim_time:=true
         # Per-domain /clock authority. Each drone runs on its own
